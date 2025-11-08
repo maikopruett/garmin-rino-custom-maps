@@ -1,5 +1,7 @@
 # Garmin Custom Map Converter
 
+Made by Maiko for the love of the game
+
 A Python tool to convert GeoTIFF files into Garmin-compatible KMZ files for use with Garmin devices (such as Rino series).
 
 ## Features
