@@ -657,68 +657,69 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
         
         # Build Java command
         # According to mkgmap docs: java -jar mkgmap.jar [options] [input files]
-        # If we have dependencies, we need to use -cp with main class instead
+        # Try -jar first (standard method), fall back to -cp if needed
         
-        # Ensure mkgmap.jar is first in the classpath (required for main class lookup)
-        jar_files_clean = [j for j in jar_files if j != mkgmap_jar_abs]
-        jar_files_clean.insert(0, mkgmap_jar_abs)
-        
-        if len(jar_files_clean) > 1:
-            # Multiple JARs - use classpath with main class
-            classpath = os.pathsep.join(jar_files_clean)
-            print(f"Found {len(jar_files_clean)} JAR files, using classpath method")
-            print(f"  Main JAR: {os.path.basename(mkgmap_jar_abs)}")
-            print(f"  Dependencies: {len(jar_files_clean) - 1} JAR(s)")
-            java_args = [
-                "java", "-cp", classpath,
-                "uk.me.parabola.mkgmap.Main",
-                f"--output-dir={mkgmap_output_dir}",
-                f"--mapname={mapname}",
-                osm_path
-            ]
-        else:
-            # Single JAR - use -jar method (as per mkgmap documentation)
-            print(f"Using mkgmap.jar (standard method)")
-            java_args = [
-                "java", "-jar", mkgmap_jar,
-                f"--output-dir={mkgmap_output_dir}",
-                f"--mapname={mapname}",
-                osm_path
-            ]
+        # First try the standard -jar method (works even with dependencies in lib/)
+        print(f"Using mkgmap.jar (standard method)")
+        java_args_jar = [
+            "java", "-jar", mkgmap_jar,
+            f"--output-dir={mkgmap_output_dir}",
+            f"--mapname={mapname}",
+            osm_path
+        ]
         
         try:
+            # Try -jar method first
             result = subprocess.run(
-                java_args,
+                java_args_jar,
                 check=True,
                 capture_output=True,
                 text=True
             )
         except subprocess.CalledProcessError as e:
-            error_msg = f"mkgmap failed: {e.stderr}"
-            if e.stdout:
-                error_msg += f"\nstdout: {e.stdout}"
-            
-            # Check for main class not found error
-            if "Could not find or load main class" in error_msg:
-                error_msg += (
-                    f"\n\nMain class 'uk.me.parabola.mkgmap.Main' not found.\n"
-                    f"Troubleshooting:\n"
-                    f"  1. Verify mkgmap.jar is valid: try 'java -jar {mkgmap_jar_abs} --version'\n"
-                    f"  2. If that works, the issue is with the classpath setup\n"
-                    f"  3. Try placing mkgmap.jar directly in current directory and run again"
-                )
-            # Check if it's a missing dependency error
-            elif "NoClassDefFoundError" in error_msg or "ClassNotFoundException" in error_msg:
-                error_msg += (
-                    "\n\nThis error suggests mkgmap is missing required dependencies (likely Osmosis JARs).\n"
-                    "To fix this:\n"
-                    "  1. Download Osmosis from https://github.com/openstreetmap/osmosis/releases\n"
-                    "  2. Extract the Osmosis JAR files (osmosis-core.jar, osmosis-pbf.jar, etc.)\n"
-                    "  3. Place them in the same directory as mkgmap.jar, or in a 'lib' subdirectory\n"
-                    "  4. Alternatively, place them in the current directory or a 'lib' subdirectory"
-                )
-            
-            raise RuntimeError(error_msg)
+            # If -jar fails with missing dependencies, try classpath method
+            if "NoClassDefFoundError" in e.stderr or "ClassNotFoundException" in e.stderr:
+                print(f"  -jar method failed, trying with classpath (found {len(jar_files)} JAR files)")
+                # Ensure mkgmap.jar is first in the classpath
+                jar_files_clean = [j for j in jar_files if j != mkgmap_jar_abs]
+                jar_files_clean.insert(0, mkgmap_jar_abs)
+                classpath = os.pathsep.join(jar_files_clean)
+                java_args_cp = [
+                    "java", "-cp", classpath,
+                    "uk.me.parabola.mkgmap.Main",
+                    f"--output-dir={mkgmap_output_dir}",
+                    f"--mapname={mapname}",
+                    osm_path
+                ]
+                try:
+                    result = subprocess.run(
+                        java_args_cp,
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                except subprocess.CalledProcessError as e2:
+                    # Both methods failed, format error message
+                    error_msg = f"mkgmap failed: {e2.stderr}"
+                    if e2.stdout:
+                        error_msg += f"\nstdout: {e2.stdout}"
+                    
+                    # Check for main class not found error
+                    if "Could not find or load main class" in error_msg:
+                        error_msg += (
+                            f"\n\nMain class 'uk.me.parabola.mkgmap.Main' not found.\n"
+                            f"Troubleshooting:\n"
+                            f"  1. Verify mkgmap.jar is valid: try 'java -jar {mkgmap_jar_abs} --version'\n"
+                            f"  2. If that works, the issue is with the classpath setup\n"
+                            f"  3. Check that all JAR files in lib/ are valid"
+                        )
+                    raise RuntimeError(error_msg)
+            else:
+                # Re-raise if it's a different error
+                error_msg = f"mkgmap failed: {e.stderr}"
+                if e.stdout:
+                    error_msg += f"\nstdout: {e.stdout}"
+                raise RuntimeError(error_msg)
         
         # Find the generated IMG file (mkgmap creates it with the mapname)
         img_filename = f"{mapname}.img"
