@@ -12,6 +12,7 @@ import tempfile
 import zipfile
 from osgeo import gdal
 from osgeo import osr
+from osgeo import ogr
 from xml.etree import ElementTree as ET
 
 
@@ -421,6 +422,146 @@ def generate_mapname(input_filename):
     return numeric_id.zfill(8)
 
 
+def shapefile_to_osm(shapefile_path, osm_path):
+    """
+    Convert Shapefile to OSM XML format using GDAL Python bindings.
+    
+    Args:
+        shapefile_path: Path to input Shapefile (.shp)
+        osm_path: Path to output OSM XML file
+    """
+    # Open the shapefile
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    datasource = driver.Open(shapefile_path, 0)
+    if datasource is None:
+        raise RuntimeError(f"Could not open shapefile: {shapefile_path}")
+    
+    layer = datasource.GetLayer()
+    
+    # Get spatial reference and set up coordinate transformation if needed
+    source_srs = layer.GetSpatialRef()
+    target_srs = osr.SpatialReference()
+    target_srs.ImportFromEPSG(4326)  # WGS84
+    
+    transform = None
+    if source_srs and not source_srs.IsSame(target_srs):
+        transform = osr.CoordinateTransformation(source_srs, target_srs)
+    
+    # Create OSM XML structure
+    osm_root = ET.Element("osm", version="0.6", generator="garmin-map-converter")
+    
+    node_id = 1
+    way_id = 1
+    
+    def transform_point(x, y):
+        """Transform a point to WGS84 if needed."""
+        if transform:
+            try:
+                # TransformPoint returns (lat, lon, z) but we need (lon, lat)
+                lat, lon, _ = transform.TransformPoint(x, y)
+                return lon, lat
+            except:
+                # If transformation fails, return as-is
+                return x, y
+        return x, y
+    
+    # Process each feature (polygon) in the shapefile
+    for feature in layer:
+        geometry = feature.GetGeometryRef()
+        if geometry is None:
+            continue
+        
+        # Get geometry type
+        geom_type = geometry.GetGeometryType()
+        
+        if geom_type == ogr.wkbPolygon or geom_type == ogr.wkbMultiPolygon:
+            # Handle polygons
+            if geom_type == ogr.wkbPolygon:
+                polygons = [geometry]
+            else:  # MultiPolygon
+                polygons = []
+                for i in range(geometry.GetGeometryCount()):
+                    polygons.append(geometry.GetGeometryRef(i))
+            
+            for polygon in polygons:
+                # Get exterior ring
+                exterior_ring = polygon.GetGeometryRef(0)
+                if exterior_ring is None:
+                    continue
+                
+                # Create nodes for each point in the ring
+                node_ids = []
+                point_count = exterior_ring.GetPointCount()
+                
+                for i in range(point_count):
+                    point = exterior_ring.GetPoint(i)
+                    lon, lat = transform_point(point[0], point[1])
+                    
+                    # Create node element
+                    node_elem = ET.SubElement(osm_root, "node", 
+                                             id=str(node_id),
+                                             lat=str(lat),
+                                             lon=str(lon))
+                    node_ids.append(node_id)
+                    node_id += 1
+                
+                # Create way element connecting the nodes
+                if len(node_ids) > 0:
+                    way_elem = ET.SubElement(osm_root, "way", id=str(way_id))
+                    
+                    # Add node references
+                    for nid in node_ids:
+                        ET.SubElement(way_elem, "nd", ref=str(nid))
+                    
+                    # Close the way by adding first node again if it's a polygon
+                    if len(node_ids) > 2:
+                        ET.SubElement(way_elem, "nd", ref=str(node_ids[0]))
+                    
+                    # Add tag for area
+                    ET.SubElement(way_elem, "tag", k="area", v="yes")
+                    
+                    way_id += 1
+        
+        elif geom_type == ogr.wkbLineString or geom_type == ogr.wkbMultiLineString:
+            # Handle linestrings
+            if geom_type == ogr.wkbLineString:
+                linestrings = [geometry]
+            else:  # MultiLineString
+                linestrings = []
+                for i in range(geometry.GetGeometryCount()):
+                    linestrings.append(geometry.GetGeometryRef(i))
+            
+            for linestring in linestrings:
+                node_ids = []
+                point_count = linestring.GetPointCount()
+                
+                for i in range(point_count):
+                    point = linestring.GetPoint(i)
+                    lon, lat = transform_point(point[0], point[1])
+                    
+                    node_elem = ET.SubElement(osm_root, "node",
+                                             id=str(node_id),
+                                             lat=str(lat),
+                                             lon=str(lon))
+                    node_ids.append(node_id)
+                    node_id += 1
+                
+                if len(node_ids) > 1:
+                    way_elem = ET.SubElement(osm_root, "way", id=str(way_id))
+                    for nid in node_ids:
+                        ET.SubElement(way_elem, "nd", ref=str(nid))
+                    way_id += 1
+    
+    datasource = None
+    
+    # Write OSM XML to file
+    tree = ET.ElementTree(osm_root)
+    # ET.indent is available in Python 3.9+, use it if available
+    if hasattr(ET, 'indent'):
+        ET.indent(tree, space="  ")
+    tree.write(osm_path, encoding="utf-8", xml_declaration=True)
+
+
 def tif_to_img(input_tif, output_path, mkgmap_path=None):
     """
     Convert GeoTIFF to Garmin IMG format using gdal_polygonize and mkgmap.
@@ -467,25 +608,15 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
         if not os.path.exists(shapefile_path):
             raise RuntimeError("gdal_polygonize.py did not create Shapefile")
         
-        # Step 2: Convert Shapefile to OSM format using ogr2ogr
+        # Step 2: Convert Shapefile to OSM format using Python/GDAL
         print(f"Converting Shapefile to OSM format...")
         try:
-            result = subprocess.run(
-                ["ogr2ogr", "-f", "OSM", osm_path, shapefile_path],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                "ogr2ogr not found. Make sure GDAL is properly installed and "
-                "ogr2ogr is in your PATH."
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"ogr2ogr failed: {e.stderr}")
+            shapefile_to_osm(shapefile_path, osm_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to convert Shapefile to OSM: {str(e)}")
         
         if not os.path.exists(osm_path):
-            raise RuntimeError("ogr2ogr did not create OSM file")
+            raise RuntimeError("Failed to create OSM file")
         
         # Step 3: Convert OSM to IMG using mkgmap
         print(f"Converting OSM to IMG format using mkgmap...")
