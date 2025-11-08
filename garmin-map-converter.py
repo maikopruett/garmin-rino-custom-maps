@@ -8,12 +8,16 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from osgeo import gdal
 from osgeo import osr
 from osgeo import ogr
 from xml.etree import ElementTree as ET
+
+# Suppress GDAL warning about UseExceptions
+gdal.UseExceptions()
 
 
 def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
@@ -460,6 +464,10 @@ def shapefile_to_osm(shapefile_path, osm_path):
     
     layer = datasource.GetLayer()
     
+    # Get feature count for progress tracking
+    feature_count = layer.GetFeatureCount()
+    layer.ResetReading()  # Reset to beginning after counting
+    
     # Get spatial reference and set up coordinate transformation if needed
     source_srs = layer.GetSpatialRef()
     target_srs = osr.SpatialReference()
@@ -488,6 +496,7 @@ def shapefile_to_osm(shapefile_path, osm_path):
         return x, y
     
     # Process each feature (polygon) in the shapefile
+    processed_features = 0
     for feature in layer:
         geometry = feature.GetGeometryRef()
         if geometry is None:
@@ -573,6 +582,18 @@ def shapefile_to_osm(shapefile_path, osm_path):
                     for nid in node_ids:
                         ET.SubElement(way_elem, "nd", ref=str(nid))
                     way_id += 1
+        
+        # Update progress
+        processed_features += 1
+        if feature_count > 0:
+            progress = (processed_features / feature_count) * 100
+            # Update progress on same line
+            sys.stdout.write(f"\rProcessing features: {processed_features}/{feature_count} ({progress:.1f}%)")
+            sys.stdout.flush()
+    
+    # Print newline after progress updates
+    if feature_count > 0:
+        print()  # New line after progress bar
     
     datasource = None
     
@@ -701,11 +722,32 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                         jar_paths_set.add(jar_path)
         
         # Build Java command
-        # Use classpath method if we have multiple JARs, otherwise try -jar
-        if len(jar_files) > 1:
-            # Multiple JARs - use classpath
+        mkgmap_jar_abs = os.path.abspath(mkgmap_jar)
+        mkgmap_dir = os.path.dirname(mkgmap_jar_abs)
+        
+        # Check if there's a lib directory next to mkgmap.jar
+        lib_dir = os.path.join(mkgmap_dir, "lib")
+        has_lib_dir = os.path.exists(lib_dir) and os.path.isdir(lib_dir)
+        
+        if has_lib_dir and len(jar_files) > 1:
+            # Use wildcard classpath for lib directory (works on Unix/macOS)
+            # This is more reliable than listing all JARs individually
+            classpath = f"{mkgmap_jar_abs}{os.pathsep}{lib_dir}/*"
+            print(f"Found mkgmap.jar with lib directory, using wildcard classpath")
+            java_args = [
+                "java", "-cp", classpath,
+                "uk.me.parabola.mkgmap.Main",
+                f"--output-dir={mkgmap_output_dir}",
+                f"--mapname={mapname}",
+                osm_path
+            ]
+        elif len(jar_files) > 1:
+            # Multiple JARs - use explicit classpath
+            # Ensure mkgmap.jar is first (required for main class lookup)
+            jar_files = [j for j in jar_files if j != mkgmap_jar_abs]
+            jar_files.insert(0, mkgmap_jar_abs)
             classpath = os.pathsep.join(jar_files)
-            print(f"Found {len(jar_files)} JAR files, using classpath method")
+            print(f"Found {len(jar_files)} JAR files, using explicit classpath")
             java_args = [
                 "java", "-cp", classpath,
                 "uk.me.parabola.mkgmap.Main",
@@ -735,8 +777,17 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
             if e.stdout:
                 error_msg += f"\nstdout: {e.stdout}"
             
+            # Check for main class not found error
+            if "Could not find or load main class" in error_msg:
+                error_msg += (
+                    f"\n\nMain class 'uk.me.parabola.mkgmap.Main' not found.\n"
+                    f"Troubleshooting:\n"
+                    f"  1. Verify mkgmap.jar is valid: try 'java -jar {mkgmap_jar_abs} --version'\n"
+                    f"  2. If that works, the issue is with the classpath setup\n"
+                    f"  3. Try placing mkgmap.jar directly in current directory and run again"
+                )
             # Check if it's a missing dependency error
-            if "NoClassDefFoundError" in error_msg or "ClassNotFoundException" in error_msg:
+            elif "NoClassDefFoundError" in error_msg or "ClassNotFoundException" in error_msg:
                 error_msg += (
                     "\n\nThis error suggests mkgmap is missing required dependencies (likely Osmosis JARs).\n"
                     "To fix this:\n"
