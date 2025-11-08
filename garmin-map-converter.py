@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Garmin Custom Map Converter
-Converts GeoTIFF files to Garmin-compatible KMZ files.
+Converts GeoTIFF files to Garmin-compatible KMZ or IMG files.
 """
 
 import argparse
 import os
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from osgeo import gdal
@@ -354,9 +355,171 @@ def create_kmz(kml_path, image_path, output_kmz):
         kmz.write(image_path, image_basename)
 
 
+def find_mkgmap_jar(mkgmap_path=None):
+    """
+    Find mkgmap.jar file.
+    
+    Args:
+        mkgmap_path: Optional user-specified path to mkgmap.jar
+        
+    Returns:
+        Path to mkgmap.jar if found
+        
+    Raises:
+        FileNotFoundError: If mkgmap.jar cannot be found
+    """
+    # If user provided a path, use it
+    if mkgmap_path:
+        if os.path.exists(mkgmap_path):
+            return mkgmap_path
+        else:
+            raise FileNotFoundError(f"mkgmap.jar not found at specified path: {mkgmap_path}")
+    
+    # Check current directory
+    current_dir_jar = os.path.join(os.getcwd(), "mkgmap.jar")
+    if os.path.exists(current_dir_jar):
+        return current_dir_jar
+    
+    # Check PATH
+    path_jar = shutil.which("mkgmap.jar")
+    if path_jar and os.path.exists(path_jar):
+        return path_jar
+    
+    # Check if mkgmap.jar is in PATH as a command (unlikely but possible)
+    mkgmap_cmd = shutil.which("mkgmap")
+    if mkgmap_cmd:
+        # If mkgmap command exists, check if it's a jar wrapper
+        # For now, we'll just raise an error and let user specify
+        pass
+    
+    raise FileNotFoundError(
+        "mkgmap.jar not found. Please:\n"
+        "  1. Download mkgmap.jar from https://www.mkgmap.org.uk/\n"
+        "  2. Place it in the current directory, or\n"
+        "  3. Use --mkgmap-path to specify the location"
+    )
+
+
+def generate_mapname(input_filename):
+    """
+    Generate a unique mapname (numeric ID) from input filename.
+    
+    Args:
+        input_filename: Path to input file
+        
+    Returns:
+        String of 8 digits derived from filename hash
+    """
+    import hashlib
+    base_name = os.path.splitext(os.path.basename(input_filename))[0]
+    # Create a hash from the filename and take first 8 digits
+    hash_obj = hashlib.md5(base_name.encode())
+    hash_hex = hash_obj.hexdigest()
+    # Convert hex to numeric string (take first 8 characters, convert to int, then back to string)
+    numeric_id = str(int(hash_hex[:8], 16))[:8]
+    # Pad with zeros if needed to ensure 8 digits
+    return numeric_id.zfill(8)
+
+
+def tif_to_img(input_tif, output_path, mkgmap_path=None):
+    """
+    Convert GeoTIFF to Garmin IMG format using gdal_polygonize and mkgmap.
+    
+    Args:
+        input_tif: Path to input GeoTIFF file
+        output_path: Path to output IMG file
+        mkgmap_path: Optional path to mkgmap.jar (will auto-detect if not provided)
+        
+    Returns:
+        Path to the created IMG file
+    """
+    # Find mkgmap.jar
+    mkgmap_jar = find_mkgmap_jar(mkgmap_path)
+    
+    # Create temporary directory for intermediate files
+    temp_dir = tempfile.mkdtemp(prefix="garmin_img_")
+    
+    try:
+        base_name = os.path.splitext(os.path.basename(input_tif))[0]
+        osm_path = os.path.join(temp_dir, base_name + ".osm")
+        mkgmap_output_dir = os.path.join(temp_dir, "mkgmap_output")
+        os.makedirs(mkgmap_output_dir, exist_ok=True)
+        
+        # Step 1: Convert GeoTIFF to OSM format using gdal_polygonize
+        print(f"Converting {input_tif} to OSM format...")
+        try:
+            result = subprocess.run(
+                ["gdal_polygonize.py", input_tif, "-f", "OSM", osm_path],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                "gdal_polygonize.py not found. Make sure GDAL is properly installed and "
+                "gdal_polygonize.py is in your PATH."
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"gdal_polygonize.py failed: {e.stderr}")
+        
+        if not os.path.exists(osm_path):
+            raise RuntimeError("gdal_polygonize.py did not create OSM file")
+        
+        # Step 2: Convert OSM to IMG using mkgmap
+        print(f"Converting OSM to IMG format using mkgmap...")
+        mapname = generate_mapname(input_tif)
+        
+        # Check if Java is available
+        java_cmd = shutil.which("java")
+        if not java_cmd:
+            raise FileNotFoundError(
+                "Java runtime not found. Please install Java (JRE) to use IMG conversion."
+            )
+        
+        try:
+            result = subprocess.run(
+                [
+                    "java", "-jar", mkgmap_jar,
+                    f"--output-dir={mkgmap_output_dir}",
+                    f"--mapname={mapname}",
+                    osm_path
+                ],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"mkgmap failed: {e.stderr}")
+        
+        # Find the generated IMG file (mkgmap creates it with the mapname)
+        img_filename = f"{mapname}.img"
+        generated_img = os.path.join(mkgmap_output_dir, img_filename)
+        
+        if not os.path.exists(generated_img):
+            # Sometimes mkgmap creates files with different names, search for .img files
+            img_files = [f for f in os.listdir(mkgmap_output_dir) if f.endswith('.img')]
+            if img_files:
+                generated_img = os.path.join(mkgmap_output_dir, img_files[0])
+            else:
+                raise RuntimeError(f"mkgmap did not create IMG file in {mkgmap_output_dir}")
+        
+        # Move IMG file to final output location
+        output_dir = os.path.dirname(output_path) or '.'
+        os.makedirs(output_dir, exist_ok=True)
+        shutil.move(generated_img, output_path)
+        
+        print(f"Successfully created {output_path}")
+        return output_path
+        
+    finally:
+        # Clean up temporary directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert GeoTIFF files to Garmin-compatible KMZ files'
+        description='Convert GeoTIFF files to Garmin-compatible KMZ or IMG files'
     )
     parser.add_argument(
         'input',
@@ -364,7 +527,18 @@ def main():
     )
     parser.add_argument(
         '-o', '--output',
-        help='Path to output KMZ file (default: input filename with .kmz extension)',
+        help='Path to output file (default: input filename with .kmz or .img extension)',
+        default=None
+    )
+    parser.add_argument(
+        '--type',
+        choices=['kmz', 'img'],
+        default=None,
+        help='Conversion type: kmz or img (if not provided, will prompt interactively)'
+    )
+    parser.add_argument(
+        '--mkgmap-path',
+        help='Path to mkgmap.jar (required for IMG conversion, will auto-detect if not provided)',
         default=None
     )
     parser.add_argument(
@@ -380,47 +554,79 @@ def main():
         print(f"Error: Input file '{args.input}' does not exist.")
         return 1
     
-    # Determine output path
+    # Determine conversion type
+    conversion_type = args.type
+    if conversion_type is None:
+        # Interactive prompt
+        while True:
+            try:
+                user_input = input("Select conversion type: 1) KMZ  2) IMG [1]: ").strip()
+                if user_input == '' or user_input == '1':
+                    conversion_type = 'kmz'
+                    break
+                elif user_input == '2':
+                    conversion_type = 'img'
+                    break
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return 1
+    
+    # Determine output path based on conversion type
     if args.output is None:
         base_name = os.path.splitext(os.path.basename(args.input))[0]
         output_dir = os.path.dirname(args.input) or '.'
-        args.output = os.path.join(output_dir, base_name + ".kmz")
+        extension = '.img' if conversion_type == 'img' else '.kmz'
+        args.output = os.path.join(output_dir, base_name + extension)
     
-    # Create temporary directory
-    temp_dir = args.temp_dir
-    if temp_dir is None:
-        temp_dir = tempfile.mkdtemp(prefix="garmin_converter_")
-        cleanup_temp = True
-    else:
-        os.makedirs(temp_dir, exist_ok=True)
-        cleanup_temp = False
+    # Branch based on conversion type
+    if conversion_type == 'kmz':
+        # KMZ conversion (existing flow)
+        # Create temporary directory
+        temp_dir = args.temp_dir
+        if temp_dir is None:
+            temp_dir = tempfile.mkdtemp(prefix="garmin_converter_")
+            cleanup_temp = True
+        else:
+            os.makedirs(temp_dir, exist_ok=True)
+            cleanup_temp = False
+        
+        try:
+            # Step 1: Convert TIF to JPG + initial KML
+            print(f"Converting {args.input} to JPG and generating KML...")
+            jpg_path, initial_kml_path, bounds = tif_to_kml_img(args.input, temp_dir)
+            
+            # Step 2: Fix KML format
+            print("Fixing KML format for Garmin compatibility...")
+            doc_kml_path = os.path.join(temp_dir, "doc.kml")
+            image_filename = os.path.basename(jpg_path)
+            fix_kml_format(initial_kml_path, doc_kml_path, image_filename, args.input)
+            
+            # Step 3: Package into KMZ
+            print(f"Creating KMZ file: {args.output}")
+            create_kmz(doc_kml_path, jpg_path, args.output)
+            
+            print(f"Successfully created {args.output}")
+            return 0
+            
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            return 1
+            
+        finally:
+            # Clean up temporary directory if we created it
+            if cleanup_temp and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
     
-    try:
-        # Step 1: Convert TIF to JPG + initial KML
-        print(f"Converting {args.input} to JPG and generating KML...")
-        jpg_path, initial_kml_path, bounds = tif_to_kml_img(args.input, temp_dir)
-        
-        # Step 2: Fix KML format
-        print("Fixing KML format for Garmin compatibility...")
-        doc_kml_path = os.path.join(temp_dir, "doc.kml")
-        image_filename = os.path.basename(jpg_path)
-        fix_kml_format(initial_kml_path, doc_kml_path, image_filename, args.input)
-        
-        # Step 3: Package into KMZ
-        print(f"Creating KMZ file: {args.output}")
-        create_kmz(doc_kml_path, jpg_path, args.output)
-        
-        print(f"Successfully created {args.output}")
-        return 0
-        
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return 1
-        
-    finally:
-        # Clean up temporary directory if we created it
-        if cleanup_temp and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+    elif conversion_type == 'img':
+        # IMG conversion (new flow)
+        try:
+            tif_to_img(args.input, args.output, args.mkgmap_path)
+            return 0
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            return 1
 
 
 if __name__ == "__main__":
