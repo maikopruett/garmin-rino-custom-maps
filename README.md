@@ -13,8 +13,7 @@ A Python tool to convert GeoTIFF files into Garmin-compatible KMZ files for use 
 ## Requirements
 
 - Python 3.6 or higher
-- GDAL library (see installation instructions below)
-- pyproj library (for coordinate transformation)
+- GDAL library (includes coordinate transformation capabilities - see installation instructions below)
 
 ## Installation
 
@@ -102,8 +101,8 @@ optional arguments:
 ## How It Works
 
 1. **TIF to JPG Conversion**: Uses GDAL to convert the GeoTIFF to a JPEG image
-2. **Coordinate System Detection**: Reads the coordinate reference system (CRS) from the GeoTIFF metadata
-3. **Coordinate Transformation**: Converts coordinates from the source CRS (e.g., UTM) to WGS84 (EPSG:4326) using pyproj, which is required for KML files
+2. **Coordinate System Detection**: Reads the coordinate reference system (CRS) from the GeoTIFF metadata using GDAL
+3. **Coordinate Transformation**: Converts coordinates from the source CRS (e.g., UTM) to WGS84 (EPSG:4326) using GDAL's built-in `osr.CoordinateTransformation` - no additional packages needed!
 4. **Georeferencing Extraction**: Extracts geographic bounds (north, south, east, west) in WGS84 decimal degrees
 5. **KML Generation**: Creates an initial KML file with the georeferencing information
 6. **KML Format Fix**: Transforms the KML to Garmin-compatible format:
@@ -123,11 +122,11 @@ The KMZ file can be directly imported into Garmin BaseCamp or transferred to com
 
 ## Coordinate System Support
 
-The script automatically handles coordinate system conversion:
-- **Detects CRS**: Reads the coordinate reference system from GeoTIFF metadata
-- **Converts to WGS84**: Transforms coordinates to WGS84 (EPSG:4326) required for KML
+The script automatically handles coordinate system conversion using GDAL's built-in `osr` module:
+- **Detects CRS**: Reads the coordinate reference system from GeoTIFF metadata (WKT format)
+- **Converts to WGS84**: Transforms coordinates to WGS84 (EPSG:4326) required for KML using `osr.CoordinateTransformation`
 - **Handles projections**: Works with UTM, State Plane, and other projected coordinate systems
-- **Fallback detection**: If CRS metadata is missing, attempts to detect from coordinate values
+- **No extra dependencies**: Uses only GDAL - no need for pyproj or other packages!
 
 If your GeoTIFF uses a projected coordinate system (like UTM), the script will automatically convert it to geographic coordinates (latitude/longitude) for the KML file.
 
@@ -138,16 +137,11 @@ If you get `ImportError: No module named 'osgeo'`, make sure GDAL is properly in
 - Verify GDAL installation: `gdalinfo --version`
 - Reinstall Python bindings: `pip install --upgrade gdal`
 
-### pyproj Import Error
-If you get an error about pyproj, install it with:
-```bash
-pip install pyproj
-```
-
 ### Coordinate Transformation Errors
 If you encounter errors related to coordinate transformation:
 - Ensure your GeoTIFF has proper CRS metadata (check with `gdalinfo yourfile.tif`)
-- The script will attempt to auto-detect UTM zones if metadata is missing, but may need manual CRS specification
+- The script uses GDAL's built-in `osr` module for coordinate transformation - no additional packages needed
+- If transformation fails, the script will warn you and return coordinates as-is (they may not be in WGS84)
 
 ### File Not Found Error
 Ensure the input TIF file path is correct and the file exists.

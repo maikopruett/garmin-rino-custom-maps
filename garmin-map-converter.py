@@ -10,26 +10,17 @@ import shutil
 import tempfile
 import zipfile
 from osgeo import gdal
+from osgeo import osr
 from xml.etree import ElementTree as ET
-try:
-    from osgeo import osr
-    OSR_AVAILABLE = True
-except ImportError:
-    OSR_AVAILABLE = False
-try:
-    from pyproj import Transformer, CRS
-    PYPROJ_AVAILABLE = True
-except ImportError:
-    PYPROJ_AVAILABLE = False
 
 
 def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
     """
-    Convert coordinates from source CRS to WGS84 (EPSG:4326).
+    Convert coordinates from source CRS to WGS84 (EPSG:4326) using GDAL's osr.
     
     Args:
         minx, miny, maxx, maxy: Bounding box coordinates in source CRS
-        projection_wkt: Optional WKT projection string from GDAL
+        projection_wkt: WKT projection string from GDAL
         
     Returns:
         tuple: (west, south, east, north) in WGS84 decimal degrees
@@ -39,70 +30,47 @@ def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
         # Already in WGS84, return as-is
         return minx, miny, maxx, maxy
     
-    if not PYPROJ_AVAILABLE:
-        print("Warning: pyproj not available. Coordinates may not be in WGS84.")
-        print("If your GeoTIFF uses a projected coordinate system (like UTM),")
-        print("install pyproj: pip install pyproj")
+    if not projection_wkt or not projection_wkt.strip():
+        print("Warning: No projection information found. Assuming coordinates are already in WGS84.")
         return minx, miny, maxx, maxy
     
-    # Try to determine source CRS
-    source_crs_str = None
-    
-    # Method 1: Try to get EPSG code from WKT using osr if available
-    if OSR_AVAILABLE and projection_wkt:
+    try:
+        # Create source spatial reference from WKT
+        source_srs = osr.SpatialReference()
+        source_srs.ImportFromWkt(projection_wkt)
+        
+        # Create target spatial reference (WGS84)
+        target_srs = osr.SpatialReference()
+        target_srs.ImportFromEPSG(4326)  # WGS84
+        
+        # Check if already WGS84
+        if source_srs.IsSame(target_srs):
+            return minx, miny, maxx, maxy
+        
+        # Create coordinate transformation
+        transform = osr.CoordinateTransformation(source_srs, target_srs)
+        
+        # Transform coordinates
+        # Transform southwest corner (minx, miny)
+        lon_west, lat_south, _ = transform.TransformPoint(minx, miny)
+        # Transform northeast corner (maxx, maxy)
+        lon_east, lat_north, _ = transform.TransformPoint(maxx, maxy)
+        
+        return lon_west, lat_south, lon_east, lat_north
+        
+    except Exception as e:
+        print(f"Warning: Could not transform coordinates to WGS84: {str(e)}")
+        print("Returning coordinates as-is. They may not be in WGS84.")
+        # Try to get EPSG code for better error message
         try:
             source_srs = osr.SpatialReference()
             source_srs.ImportFromWkt(projection_wkt)
-            source_epsg = source_srs.GetAuthorityCode(None)
-            if source_epsg:
-                source_crs_str = f"EPSG:{source_epsg}"
+            epsg_code = source_srs.GetAuthorityCode(None)
+            if epsg_code:
+                print(f"Source CRS appears to be EPSG:{epsg_code}")
         except:
             pass
-    
-    # Method 2: Try to use WKT directly with pyproj
-    if not source_crs_str and projection_wkt:
-        try:
-            source_crs = CRS.from_wkt(projection_wkt)
-            if source_crs.to_epsg():
-                source_crs_str = f"EPSG:{source_crs.to_epsg()}"
-            else:
-                # Use WKT directly
-                source_crs_str = projection_wkt
-        except:
-            pass
-    
-    # Method 3: Auto-detect from coordinate values (fallback)
-    if not source_crs_str:
-        # Try to detect UTM zone from coordinates
-        # UTM coordinates are typically 6-7 digits for easting, 7 digits for northing
-        if 100000 <= abs(minx) <= 1000000 and 1000000 <= abs(miny) <= 10000000:
-            print("Warning: Could not determine CRS from metadata. Attempting to detect...")
-            # Default to UTM Zone 11N (common for western US) as fallback
-            source_crs_str = "EPSG:32611"
-            print(f"Using fallback CRS: {source_crs_str}")
-        else:
-            print("Warning: Could not determine coordinate system. Assuming WGS84.")
-            return minx, miny, maxx, maxy
-    
-    # Check if already WGS84
-    if source_crs_str == "EPSG:4326":
         return minx, miny, maxx, maxy
-    
-    # Create transformer
-    try:
-        transformer = Transformer.from_crs(source_crs_str, "EPSG:4326", always_xy=True)
-    except Exception as e:
-        print(f"Warning: Could not create coordinate transformer: {str(e)}")
-        print("Returning coordinates as-is. They may not be in WGS84.")
-        return minx, miny, maxx, maxy
-    
-    # Transform coordinates
-    # Transform southwest corner
-    lon_west, lat_south = transformer.transform(minx, miny)
-    # Transform northeast corner
-    lon_east, lat_north = transformer.transform(maxx, maxy)
-    
-    return lon_west, lat_south, lon_east, lat_north
 
 
 def tif_to_kml_img(input_tif, output_dir):
