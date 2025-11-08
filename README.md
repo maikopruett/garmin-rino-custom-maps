@@ -14,8 +14,7 @@ A Python tool to convert GeoTIFF files into Garmin-compatible KMZ files for use 
 ## Requirements
 
 - Python 3.6 or higher
-- GDAL library (includes coordinate transformation capabilities - see installation instructions below)
-- Pillow library (for image resizing - installs automatically with requirements.txt)
+- GDAL library (includes coordinate transformation and image resizing capabilities - see installation instructions below)
 
 ## Installation
 
@@ -103,9 +102,9 @@ optional arguments:
 ## How It Works
 
 1. **TIF to JPG Conversion**: Uses GDAL to convert the GeoTIFF to a JPEG image
-2. **Image Resizing**: Automatically resizes images to meet Garmin requirements:
+2. **Image Resizing**: Automatically resizes images to meet Garmin requirements using GDAL:
    - Maximum dimensions: 1024x1024 pixels (maintains aspect ratio)
-   - Maximum file size: 3MB (adjusts quality and size as needed)
+   - Maximum file size: 3MB (adjusts JPEG quality and size as needed)
 3. **Coordinate System Detection**: Reads the coordinate reference system (CRS) from the GeoTIFF metadata using GDAL
 4. **Coordinate Transformation**: Converts coordinates from the source CRS (e.g., UTM) to WGS84 (EPSG:4326) using GDAL's built-in `osr.CoordinateTransformation` - no additional packages needed!
 5. **Georeferencing Extraction**: Extracts geographic bounds (north, south, east, west) in WGS84 decimal degrees

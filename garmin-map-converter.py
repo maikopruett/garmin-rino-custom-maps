@@ -12,11 +12,6 @@ import zipfile
 from osgeo import gdal
 from osgeo import osr
 from xml.etree import ElementTree as ET
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
 
 
 def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
@@ -99,7 +94,7 @@ def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
 
 def resize_image_for_garmin(image_path, max_size=1024, max_file_size_mb=3):
     """
-    Resize and optimize image to meet Garmin requirements:
+    Resize and optimize image to meet Garmin requirements using GDAL:
     - Max dimensions: 1024x1024 pixels
     - Max file size: 3MB
     
@@ -111,66 +106,93 @@ def resize_image_for_garmin(image_path, max_size=1024, max_file_size_mb=3):
     Returns:
         Path to the resized image (may be the same file if already compliant)
     """
-    if not PIL_AVAILABLE:
-        print("Warning: PIL/Pillow not available. Cannot resize image.")
-        print("Install with: pip install Pillow")
-        return image_path
-    
     max_file_size_bytes = max_file_size_mb * 1024 * 1024
     temp_path = None
     
     try:
-        # Open the image
-        img = Image.open(image_path)
-        original_size = img.size
+        # Open the image to get dimensions
+        dataset = gdal.Open(image_path)
+        if not dataset:
+            print("Warning: Could not open image for resizing")
+            return image_path
+        
+        width = dataset.RasterXSize
+        height = dataset.RasterYSize
         original_file_size = os.path.getsize(image_path)
         
         # Check if resizing is needed
         needs_resize = False
-        if original_size[0] > max_size or original_size[1] > max_size:
+        if width > max_size or height > max_size:
             needs_resize = True
-            print(f"Image size {original_size[0]}x{original_size[1]} exceeds {max_size}x{max_size}, resizing...")
+            print(f"Image size {width}x{height} exceeds {max_size}x{max_size}, resizing...")
         
-        # Resize if needed (maintain aspect ratio)
+        # Calculate new size maintaining aspect ratio
         if needs_resize:
-            # Calculate new size maintaining aspect ratio
-            ratio = min(max_size / original_size[0], max_size / original_size[1])
-            new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-            print(f"Resized to {new_size[0]}x{new_size[1]}")
+            ratio = min(max_size / width, max_size / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+        else:
+            new_width = width
+            new_height = height
         
-        # Save with quality adjustment to meet file size requirement
-        quality = 95
+        # If file size is acceptable and no resize needed, return early
+        if not needs_resize and original_file_size <= max_file_size_bytes:
+            dataset = None
+            return image_path
+        
+        # Create temp path for resized image
         temp_path = image_path + ".tmp"
         
-        # Try different quality levels until file size is acceptable
-        for q in range(95, 40, -5):
-            img.save(temp_path, "JPEG", quality=q, optimize=True)
+        # Try different JPEG quality levels and sizes to meet file size requirement
+        quality_levels = [95, 85, 75, 65, 55, 45]
+        current_width = new_width
+        current_height = new_height
+        
+        for quality in quality_levels:
+            # Set JPEG quality through creation options
+            translate_options = gdal.TranslateOptions(
+                format='JPEG',
+                width=current_width,
+                height=current_height,
+                creationOptions=[f'JPEG_QUALITY={quality}']
+            )
+            
+            # Resize the image
+            gdal.Translate(temp_path, dataset, options=translate_options)
             file_size = os.path.getsize(temp_path)
             
             if file_size <= max_file_size_bytes:
                 break
-            quality = q
+            
+            # If still too large, reduce size further
+            if file_size > max_file_size_bytes and current_width > 256 and current_height > 256:
+                current_width = int(current_width * 0.9)
+                current_height = int(current_height * 0.9)
+                print(f"File size {file_size / 1024 / 1024:.2f}MB too large, reducing to {current_width}x{current_height}...")
         
-        # If still too large, resize further
-        if os.path.getsize(temp_path) > max_file_size_bytes:
-            print(f"File size still too large ({os.path.getsize(temp_path) / 1024 / 1024:.2f}MB), resizing further...")
-            while os.path.getsize(temp_path) > max_file_size_bytes and img.size[0] > 256 and img.size[1] > 256:
-                # Reduce size by 10%
-                new_size = (int(img.size[0] * 0.9), int(img.size[1] * 0.9))
-                img = img.resize(new_size, Image.Resampling.LANCZOS)
-                img.save(temp_path, "JPEG", quality=85, optimize=True)
-                print(f"Resized to {new_size[0]}x{new_size[1]}, size: {os.path.getsize(temp_path) / 1024 / 1024:.2f}MB")
+        # Final check - if still too large, keep reducing size
+        while os.path.getsize(temp_path) > max_file_size_bytes and current_width > 256 and current_height > 256:
+            current_width = int(current_width * 0.9)
+            current_height = int(current_height * 0.9)
+            translate_options = gdal.TranslateOptions(
+                format='JPEG',
+                width=current_width,
+                height=current_height,
+                creationOptions=['JPEG_QUALITY=75']
+            )
+            gdal.Translate(temp_path, dataset, options=translate_options)
+            print(f"Resized to {current_width}x{current_height}, size: {os.path.getsize(temp_path) / 1024 / 1024:.2f}MB")
         
         # Replace original with resized version
         if needs_resize or os.path.getsize(temp_path) != original_file_size:
             shutil.move(temp_path, image_path)
             final_size = os.path.getsize(image_path)
-            print(f"Final image: {img.size[0]}x{img.size[1]}, {final_size / 1024 / 1024:.2f}MB")
+            print(f"Final image: {current_width}x{current_height}, {final_size / 1024 / 1024:.2f}MB")
         else:
-            if temp_path and os.path.exists(temp_path):
+            if os.path.exists(temp_path):
                 os.remove(temp_path)
         
+        dataset = None
         return image_path
         
     except Exception as e:
