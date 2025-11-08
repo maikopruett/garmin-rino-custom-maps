@@ -5,6 +5,7 @@ A Python tool to convert GeoTIFF files into Garmin-compatible KMZ files for use 
 ## Features
 
 - Converts GeoTIFF (.tif) files to JPEG images
+- Automatically detects and converts coordinate systems to WGS84 (required for KML)
 - Extracts georeferencing information and creates KML files
 - Transforms KML format to Garmin-compatible structure
 - Packages everything into KMZ files ready for Garmin import
@@ -13,6 +14,7 @@ A Python tool to convert GeoTIFF files into Garmin-compatible KMZ files for use 
 
 - Python 3.6 or higher
 - GDAL library (see installation instructions below)
+- pyproj library (for coordinate transformation)
 
 ## Installation
 
@@ -87,22 +89,34 @@ optional arguments:
 ## How It Works
 
 1. **TIF to JPG Conversion**: Uses GDAL to convert the GeoTIFF to a JPEG image
-2. **Georeferencing Extraction**: Extracts geographic bounds (north, south, east, west) from the GeoTIFF metadata
-3. **KML Generation**: Creates an initial KML file with the georeferencing information
-4. **KML Format Fix**: Transforms the KML to Garmin-compatible format:
+2. **Coordinate System Detection**: Reads the coordinate reference system (CRS) from the GeoTIFF metadata
+3. **Coordinate Transformation**: Converts coordinates from the source CRS (e.g., UTM) to WGS84 (EPSG:4326) using pyproj, which is required for KML files
+4. **Georeferencing Extraction**: Extracts geographic bounds (north, south, east, west) in WGS84 decimal degrees
+5. **KML Generation**: Creates an initial KML file with the georeferencing information
+6. **KML Format Fix**: Transforms the KML to Garmin-compatible format:
    - Changes encoding to iso-8859-1
    - Updates namespace to kml 2.1
    - Wraps in Document element
    - Ensures proper structure for Garmin devices
-5. **KMZ Packaging**: Packages the KML and JPG image into a KMZ (ZIP) file
+7. **KMZ Packaging**: Packages the KML (named `doc.kml`) and JPG image into a KMZ (ZIP) file
 
 ## Output Format
 
 The generated KMZ file contains:
-- A KML file with Garmin-compatible format
+- A KML file named `doc.kml` with Garmin-compatible format (coordinates in WGS84)
 - A JPEG image file referenced by the KML
 
 The KMZ file can be directly imported into Garmin BaseCamp or transferred to compatible Garmin devices.
+
+## Coordinate System Support
+
+The script automatically handles coordinate system conversion:
+- **Detects CRS**: Reads the coordinate reference system from GeoTIFF metadata
+- **Converts to WGS84**: Transforms coordinates to WGS84 (EPSG:4326) required for KML
+- **Handles projections**: Works with UTM, State Plane, and other projected coordinate systems
+- **Fallback detection**: If CRS metadata is missing, attempts to detect from coordinate values
+
+If your GeoTIFF uses a projected coordinate system (like UTM), the script will automatically convert it to geographic coordinates (latitude/longitude) for the KML file.
 
 ## Troubleshooting
 
@@ -110,6 +124,17 @@ The KMZ file can be directly imported into Garmin BaseCamp or transferred to com
 If you get `ImportError: No module named 'osgeo'`, make sure GDAL is properly installed:
 - Verify GDAL installation: `gdalinfo --version`
 - Reinstall Python bindings: `pip install --upgrade gdal`
+
+### pyproj Import Error
+If you get an error about pyproj, install it with:
+```bash
+pip install pyproj
+```
+
+### Coordinate Transformation Errors
+If you encounter errors related to coordinate transformation:
+- Ensure your GeoTIFF has proper CRS metadata (check with `gdalinfo yourfile.tif`)
+- The script will attempt to auto-detect UTM zones if metadata is missing, but may need manual CRS specification
 
 ### File Not Found Error
 Ensure the input TIF file path is correct and the file exists.
