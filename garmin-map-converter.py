@@ -12,6 +12,11 @@ import zipfile
 from osgeo import gdal
 from osgeo import osr
 from xml.etree import ElementTree as ET
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 
 def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
@@ -92,6 +97,89 @@ def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
         return minx, miny, maxx, maxy
 
 
+def resize_image_for_garmin(image_path, max_size=1024, max_file_size_mb=3):
+    """
+    Resize and optimize image to meet Garmin requirements:
+    - Max dimensions: 1024x1024 pixels
+    - Max file size: 3MB
+    
+    Args:
+        image_path: Path to input JPG image
+        max_size: Maximum width or height in pixels (default: 1024)
+        max_file_size_mb: Maximum file size in MB (default: 3)
+    
+    Returns:
+        Path to the resized image (may be the same file if already compliant)
+    """
+    if not PIL_AVAILABLE:
+        print("Warning: PIL/Pillow not available. Cannot resize image.")
+        print("Install with: pip install Pillow")
+        return image_path
+    
+    max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    temp_path = None
+    
+    try:
+        # Open the image
+        img = Image.open(image_path)
+        original_size = img.size
+        original_file_size = os.path.getsize(image_path)
+        
+        # Check if resizing is needed
+        needs_resize = False
+        if original_size[0] > max_size or original_size[1] > max_size:
+            needs_resize = True
+            print(f"Image size {original_size[0]}x{original_size[1]} exceeds {max_size}x{max_size}, resizing...")
+        
+        # Resize if needed (maintain aspect ratio)
+        if needs_resize:
+            # Calculate new size maintaining aspect ratio
+            ratio = min(max_size / original_size[0], max_size / original_size[1])
+            new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+            print(f"Resized to {new_size[0]}x{new_size[1]}")
+        
+        # Save with quality adjustment to meet file size requirement
+        quality = 95
+        temp_path = image_path + ".tmp"
+        
+        # Try different quality levels until file size is acceptable
+        for q in range(95, 40, -5):
+            img.save(temp_path, "JPEG", quality=q, optimize=True)
+            file_size = os.path.getsize(temp_path)
+            
+            if file_size <= max_file_size_bytes:
+                break
+            quality = q
+        
+        # If still too large, resize further
+        if os.path.getsize(temp_path) > max_file_size_bytes:
+            print(f"File size still too large ({os.path.getsize(temp_path) / 1024 / 1024:.2f}MB), resizing further...")
+            while os.path.getsize(temp_path) > max_file_size_bytes and img.size[0] > 256 and img.size[1] > 256:
+                # Reduce size by 10%
+                new_size = (int(img.size[0] * 0.9), int(img.size[1] * 0.9))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                img.save(temp_path, "JPEG", quality=85, optimize=True)
+                print(f"Resized to {new_size[0]}x{new_size[1]}, size: {os.path.getsize(temp_path) / 1024 / 1024:.2f}MB")
+        
+        # Replace original with resized version
+        if needs_resize or os.path.getsize(temp_path) != original_file_size:
+            shutil.move(temp_path, image_path)
+            final_size = os.path.getsize(image_path)
+            print(f"Final image: {img.size[0]}x{img.size[1]}, {final_size / 1024 / 1024:.2f}MB")
+        else:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+        
+        return image_path
+        
+    except Exception as e:
+        print(f"Warning: Could not resize image: {str(e)}")
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        return image_path
+
+
 def tif_to_kml_img(input_tif, output_dir):
     """
     Convert GeoTIFF to JPG image and generate initial KML file.
@@ -117,6 +205,9 @@ def tif_to_kml_img(input_tif, output_dir):
     
     # Export to JPEG (convert raster to image)
     gdal.Translate(output_img, dataset, format="JPEG")
+    
+    # Resize and optimize image to meet Garmin requirements (1024x1024 max, 3MB max)
+    output_img = resize_image_for_garmin(output_img)
     
     # Get georeferencing info
     gt = dataset.GetGeoTransform()

@@ -5,6 +5,7 @@ A Python tool to convert GeoTIFF files into Garmin-compatible KMZ files for use 
 ## Features
 
 - Converts GeoTIFF (.tif) files to JPEG images
+- Automatically resizes images to meet Garmin requirements (max 1024x1024 pixels, max 3MB)
 - Automatically detects and converts coordinate systems to WGS84 (required for KML)
 - Extracts georeferencing information and creates KML files
 - Transforms KML format to Garmin-compatible structure
@@ -14,6 +15,7 @@ A Python tool to convert GeoTIFF files into Garmin-compatible KMZ files for use 
 
 - Python 3.6 or higher
 - GDAL library (includes coordinate transformation capabilities - see installation instructions below)
+- Pillow library (for image resizing - installs automatically with requirements.txt)
 
 ## Installation
 
@@ -101,16 +103,19 @@ optional arguments:
 ## How It Works
 
 1. **TIF to JPG Conversion**: Uses GDAL to convert the GeoTIFF to a JPEG image
-2. **Coordinate System Detection**: Reads the coordinate reference system (CRS) from the GeoTIFF metadata using GDAL
-3. **Coordinate Transformation**: Converts coordinates from the source CRS (e.g., UTM) to WGS84 (EPSG:4326) using GDAL's built-in `osr.CoordinateTransformation` - no additional packages needed!
-4. **Georeferencing Extraction**: Extracts geographic bounds (north, south, east, west) in WGS84 decimal degrees
-5. **KML Generation**: Creates an initial KML file with the georeferencing information
-6. **KML Format Fix**: Transforms the KML to Garmin-compatible format:
+2. **Image Resizing**: Automatically resizes images to meet Garmin requirements:
+   - Maximum dimensions: 1024x1024 pixels (maintains aspect ratio)
+   - Maximum file size: 3MB (adjusts quality and size as needed)
+3. **Coordinate System Detection**: Reads the coordinate reference system (CRS) from the GeoTIFF metadata using GDAL
+4. **Coordinate Transformation**: Converts coordinates from the source CRS (e.g., UTM) to WGS84 (EPSG:4326) using GDAL's built-in `osr.CoordinateTransformation` - no additional packages needed!
+5. **Georeferencing Extraction**: Extracts geographic bounds (north, south, east, west) in WGS84 decimal degrees
+6. **KML Generation**: Creates an initial KML file with the georeferencing information
+7. **KML Format Fix**: Transforms the KML to Garmin-compatible format:
    - Changes encoding to iso-8859-1
    - Updates namespace to kml 2.1
    - Wraps in Document element
    - Ensures proper structure for Garmin devices
-7. **KMZ Packaging**: Packages the KML (named `doc.kml`) and JPG image into a KMZ (ZIP) file
+8. **KMZ Packaging**: Packages the KML (named `doc.kml`) and JPG image into a KMZ (ZIP) file
 
 ## Output Format
 
