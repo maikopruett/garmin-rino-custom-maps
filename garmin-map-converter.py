@@ -50,13 +50,32 @@ def convert_coordinates_to_wgs84(minx, miny, maxx, maxy, projection_wkt=None):
         # Create coordinate transformation
         transform = osr.CoordinateTransformation(source_srs, target_srs)
         
-        # Transform coordinates
-        # Transform southwest corner (minx, miny)
-        lon_west, lat_south, _ = transform.TransformPoint(minx, miny)
-        # Transform northeast corner (maxx, maxy)
-        lon_east, lat_north, _ = transform.TransformPoint(maxx, maxy)
+        # Transform all four corners to ensure we get the correct bounding box
+        # This handles cases where the bounding box doesn't align with coordinate axes
+        corners = [
+            (minx, miny),  # Southwest
+            (maxx, miny),  # Southeast
+            (maxx, maxy),  # Northeast
+            (minx, maxy)   # Northwest
+        ]
         
-        return lon_west, lat_south, lon_east, lat_north
+        transformed_corners = []
+        for x, y in corners:
+            # TransformPoint returns (latitude, longitude, z) for WGS84, so we need to swap
+            lat, lon, _ = transform.TransformPoint(x, y)
+            transformed_corners.append((lon, lat))
+        
+        # Extract all longitudes and latitudes
+        lons = [corner[0] for corner in transformed_corners]
+        lats = [corner[1] for corner in transformed_corners]
+        
+        # Get bounding box
+        west = min(lons)
+        east = max(lons)
+        south = min(lats)
+        north = max(lats)
+        
+        return west, south, east, north
         
     except Exception as e:
         print(f"Warning: Could not transform coordinates to WGS84: {str(e)}")
