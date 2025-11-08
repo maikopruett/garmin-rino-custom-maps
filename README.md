@@ -27,8 +27,21 @@ GDAL installation varies by operating system:
 # Using Homebrew (recommended)
 brew install gdal
 
-# Then install Python bindings
-pip install gdal
+# Then install Python bindings in your virtual environment
+# Make sure your virtual environment is activated first
+source venv/bin/activate  # or your venv path
+
+# Set environment variables for Homebrew GDAL
+export GDAL_CONFIG=/opt/homebrew/bin/gdal-config
+export CPLUS_INCLUDE_PATH=/opt/homebrew/include
+export C_INCLUDE_PATH=/opt/homebrew/include
+export LIBRARY_PATH=/opt/homebrew/lib
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Or use the helper script:
+# ./install_dependencies.sh
 ```
 
 #### Linux (Ubuntu/Debian)
