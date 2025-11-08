@@ -441,15 +441,16 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
     
     try:
         base_name = os.path.splitext(os.path.basename(input_tif))[0]
+        shapefile_path = os.path.join(temp_dir, base_name + ".shp")
         osm_path = os.path.join(temp_dir, base_name + ".osm")
         mkgmap_output_dir = os.path.join(temp_dir, "mkgmap_output")
         os.makedirs(mkgmap_output_dir, exist_ok=True)
         
-        # Step 1: Convert GeoTIFF to OSM format using gdal_polygonize
-        print(f"Converting {input_tif} to OSM format...")
+        # Step 1: Convert GeoTIFF to Shapefile using gdal_polygonize
+        print(f"Converting {input_tif} to Shapefile format...")
         try:
             result = subprocess.run(
-                ["gdal_polygonize.py", input_tif, "-f", "OSM", osm_path],
+                ["gdal_polygonize.py", input_tif, "-f", "ESRI Shapefile", shapefile_path],
                 check=True,
                 capture_output=True,
                 text=True
@@ -462,10 +463,31 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"gdal_polygonize.py failed: {e.stderr}")
         
-        if not os.path.exists(osm_path):
-            raise RuntimeError("gdal_polygonize.py did not create OSM file")
+        # Check if shapefile was created (it creates multiple files, so check for .shp)
+        if not os.path.exists(shapefile_path):
+            raise RuntimeError("gdal_polygonize.py did not create Shapefile")
         
-        # Step 2: Convert OSM to IMG using mkgmap
+        # Step 2: Convert Shapefile to OSM format using ogr2ogr
+        print(f"Converting Shapefile to OSM format...")
+        try:
+            result = subprocess.run(
+                ["ogr2ogr", "-f", "OSM", osm_path, shapefile_path],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                "ogr2ogr not found. Make sure GDAL is properly installed and "
+                "ogr2ogr is in your PATH."
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"ogr2ogr failed: {e.stderr}")
+        
+        if not os.path.exists(osm_path):
+            raise RuntimeError("ogr2ogr did not create OSM file")
+        
+        # Step 3: Convert OSM to IMG using mkgmap
         print(f"Converting OSM to IMG format using mkgmap...")
         mapname = generate_mapname(input_tif)
         

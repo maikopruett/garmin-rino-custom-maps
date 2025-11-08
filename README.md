@@ -192,9 +192,11 @@ optional arguments:
 
 ### IMG Conversion Process
 
-1. **TIF to OSM Conversion**: Uses `gdal_polygonize.py` to convert the GeoTIFF raster to OSM vector format
-   - This converts the raster image into polygons/vectors that can be processed by mkgmap
-2. **OSM to IMG Conversion**: Uses `mkgmap.jar` (Java tool) to convert the OSM file to Garmin IMG format
+1. **TIF to Shapefile Conversion**: Uses `gdal_polygonize.py` to convert the GeoTIFF raster to ESRI Shapefile format
+   - This converts the raster image into polygons/vectors
+2. **Shapefile to OSM Conversion**: Uses `ogr2ogr` (GDAL utility) to convert the Shapefile to OSM format
+   - OSM format is required as input for mkgmap
+3. **OSM to IMG Conversion**: Uses `mkgmap.jar` (Java tool) to convert the OSM file to Garmin IMG format
    - Generates a unique mapname (8-digit numeric ID) based on the input filename
    - Creates a native Garmin IMG file that can be directly loaded onto Garmin devices
 
@@ -260,11 +262,12 @@ If you get an error that Java is not found:
 - Verify installation: `java -version`
 - Make sure Java is in your PATH
 
-#### gdal_polygonize.py Not Found
-If you get an error that gdal_polygonize.py is not found:
-- Make sure GDAL is properly installed
+#### gdal_polygonize.py or ogr2ogr Not Found
+If you get an error that gdal_polygonize.py or ogr2ogr is not found:
+- Make sure GDAL is properly installed (both tools come with GDAL)
 - Verify GDAL installation: `gdalinfo --version`
-- On some systems, gdal_polygonize.py may be in a different location - check your GDAL installation
+- Verify tools are available: `gdal_polygonize.py --version` and `ogr2ogr --version`
+- On some systems, these tools may be in a different location - check your GDAL installation
 
 #### mkgmap Conversion Fails
 If mkgmap fails during conversion:
