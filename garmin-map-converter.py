@@ -376,10 +376,31 @@ def find_mkgmap_jar(mkgmap_path=None):
         else:
             raise FileNotFoundError(f"mkgmap.jar not found at specified path: {mkgmap_path}")
     
-    # Check current directory
-    current_dir_jar = os.path.join(os.getcwd(), "mkgmap.jar")
+    current_dir = os.getcwd()
+    
+    # Check current directory for mkgmap.jar
+    current_dir_jar = os.path.join(current_dir, "mkgmap.jar")
     if os.path.exists(current_dir_jar):
         return current_dir_jar
+    
+    # Check for mkgmap folders in current directory (common when unzipped)
+    # Look for folders starting with "mkgmap" (e.g., mkgmap-r4923, mkgmap-0.0.0, etc.)
+    if os.path.exists(current_dir):
+        for item in os.listdir(current_dir):
+            item_path = os.path.join(current_dir, item)
+            # Check if it's a directory starting with "mkgmap"
+            if os.path.isdir(item_path) and item.lower().startswith("mkgmap"):
+                # Look for mkgmap.jar inside this directory
+                jar_in_folder = os.path.join(item_path, "mkgmap.jar")
+                if os.path.exists(jar_in_folder):
+                    return jar_in_folder
+                # Also check for mkgmap.jar in subdirectories (some distributions have it nested)
+                for subitem in os.listdir(item_path):
+                    subitem_path = os.path.join(item_path, subitem)
+                    if os.path.isdir(subitem_path):
+                        nested_jar = os.path.join(subitem_path, "mkgmap.jar")
+                        if os.path.exists(nested_jar):
+                            return nested_jar
     
     # Check PATH
     path_jar = shutil.which("mkgmap.jar")
@@ -395,9 +416,10 @@ def find_mkgmap_jar(mkgmap_path=None):
     
     raise FileNotFoundError(
         "mkgmap.jar not found. Please:\n"
-        "  1. Download mkgmap.jar from https://www.mkgmap.org.uk/\n"
-        "  2. Place it in the current directory, or\n"
-        "  3. Use --mkgmap-path to specify the location"
+        "  1. Download mkgmap zip from https://www.mkgmap.org.uk/\n"
+        "  2. Unzip it in the current directory (it will create a folder like 'mkgmap-rXXXX')\n"
+        "  3. Or place mkgmap.jar directly in the current directory\n"
+        "  4. Or use --mkgmap-path to specify the location"
     )
 
 
@@ -629,20 +651,102 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                 "Java runtime not found. Please install Java (JRE) to use IMG conversion."
             )
         
+        # Build classpath for mkgmap - check for additional JAR dependencies
+        mkgmap_dir = os.path.dirname(os.path.abspath(mkgmap_jar))
+        mkgmap_jar_name = os.path.basename(mkgmap_jar)
+        
+        # Collect all JAR files in the mkgmap directory
+        jar_files = [os.path.abspath(mkgmap_jar)]
+        jar_paths_set = {os.path.abspath(mkgmap_jar)}
+        
+        if os.path.exists(mkgmap_dir):
+            # Check mkgmap directory for JAR files
+            for file in os.listdir(mkgmap_dir):
+                if file.endswith('.jar') and file != mkgmap_jar_name:
+                    jar_path = os.path.abspath(os.path.join(mkgmap_dir, file))
+                    if os.path.isfile(jar_path) and jar_path not in jar_paths_set:
+                        jar_files.append(jar_path)
+                        jar_paths_set.add(jar_path)
+            
+            # Check for lib subdirectory (common pattern)
+            lib_dir = os.path.join(mkgmap_dir, "lib")
+            if os.path.exists(lib_dir) and os.path.isdir(lib_dir):
+                for file in os.listdir(lib_dir):
+                    if file.endswith('.jar'):
+                        jar_path = os.path.abspath(os.path.join(lib_dir, file))
+                        if jar_path not in jar_paths_set:
+                            jar_files.append(jar_path)
+                            jar_paths_set.add(jar_path)
+        
+        # Also check current directory for common dependency names
+        current_dir = os.getcwd()
+        common_deps = ['osmosis-core.jar', 'osmosis-pbf.jar', 'osmosis-xml.jar', 
+                       'osmosis-osm-binary.jar', 'osmosis-pbfmigrate.jar']
+        for dep in common_deps:
+            dep_path = os.path.join(current_dir, dep)
+            if os.path.exists(dep_path):
+                dep_abs_path = os.path.abspath(dep_path)
+                if dep_abs_path not in jar_paths_set:
+                    jar_files.append(dep_abs_path)
+                    jar_paths_set.add(dep_abs_path)
+        
+        # Check for lib directory in current directory
+        current_lib_dir = os.path.join(current_dir, "lib")
+        if os.path.exists(current_lib_dir) and os.path.isdir(current_lib_dir):
+            for file in os.listdir(current_lib_dir):
+                if file.endswith('.jar'):
+                    jar_path = os.path.abspath(os.path.join(current_lib_dir, file))
+                    if jar_path not in jar_paths_set:
+                        jar_files.append(jar_path)
+                        jar_paths_set.add(jar_path)
+        
+        # Build Java command
+        # Use classpath method if we have multiple JARs, otherwise try -jar
+        if len(jar_files) > 1:
+            # Multiple JARs - use classpath
+            classpath = os.pathsep.join(jar_files)
+            print(f"Found {len(jar_files)} JAR files, using classpath method")
+            java_args = [
+                "java", "-cp", classpath,
+                "uk.me.parabola.mkgmap.Main",
+                f"--output-dir={mkgmap_output_dir}",
+                f"--mapname={mapname}",
+                osm_path
+            ]
+        else:
+            # Single JAR - use -jar method
+            print(f"Using single JAR: {mkgmap_jar}")
+            java_args = [
+                "java", "-jar", mkgmap_jar,
+                f"--output-dir={mkgmap_output_dir}",
+                f"--mapname={mapname}",
+                osm_path
+            ]
+        
         try:
             result = subprocess.run(
-                [
-                    "java", "-jar", mkgmap_jar,
-                    f"--output-dir={mkgmap_output_dir}",
-                    f"--mapname={mapname}",
-                    osm_path
-                ],
+                java_args,
                 check=True,
                 capture_output=True,
                 text=True
             )
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"mkgmap failed: {e.stderr}")
+            error_msg = f"mkgmap failed: {e.stderr}"
+            if e.stdout:
+                error_msg += f"\nstdout: {e.stdout}"
+            
+            # Check if it's a missing dependency error
+            if "NoClassDefFoundError" in error_msg or "ClassNotFoundException" in error_msg:
+                error_msg += (
+                    "\n\nThis error suggests mkgmap is missing required dependencies (likely Osmosis JARs).\n"
+                    "To fix this:\n"
+                    "  1. Download Osmosis from https://github.com/openstreetmap/osmosis/releases\n"
+                    "  2. Extract the Osmosis JAR files (osmosis-core.jar, osmosis-pbf.jar, etc.)\n"
+                    "  3. Place them in the same directory as mkgmap.jar, or in a 'lib' subdirectory\n"
+                    "  4. Alternatively, place them in the current directory or a 'lib' subdirectory"
+                )
+            
+            raise RuntimeError(error_msg)
         
         # Find the generated IMG file (mkgmap creates it with the mapname)
         img_filename = f"{mapname}.img"

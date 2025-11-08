@@ -83,11 +83,16 @@ conda install -c conda-forge gdal
 pip install -r requirements.txt
 ```
 
-### 3. Install mkgmap.jar (Required for IMG Conversion Only)
+### 3. Install mkgmap (Required for IMG Conversion Only)
 
-1. Download mkgmap.jar from [mkgmap.org.uk](https://www.mkgmap.org.uk/)
-2. Place `mkgmap.jar` in the current directory, or
-3. Use the `--mkgmap-path` argument to specify its location
+**Easiest method:**
+1. Download the mkgmap zip file from [mkgmap.org.uk](https://www.mkgmap.org.uk/download/mkgmap.html)
+2. Unzip it in the current directory (it will create a folder like `mkgmap-r4923`)
+3. That's it! The script will automatically find it and all dependencies.
+
+**Alternative methods:**
+- Place `mkgmap.jar` directly in the current directory
+- Use the `--mkgmap-path` argument to specify a custom location
 
 ## Usage
 
