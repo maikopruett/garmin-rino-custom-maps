@@ -656,15 +656,17 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                         jar_paths_set.add(jar_path)
         
         # Build Java command
+        # According to mkgmap docs: java -jar mkgmap.jar [options] [input files]
+        # If we have dependencies, we need to use -cp with main class instead
+        
         # Ensure mkgmap.jar is first in the classpath (required for main class lookup)
-        # Remove duplicates and ensure mkgmap.jar is first
         jar_files_clean = [j for j in jar_files if j != mkgmap_jar_abs]
         jar_files_clean.insert(0, mkgmap_jar_abs)
         
         if len(jar_files_clean) > 1:
-            # Multiple JARs - use explicit classpath with all JARs listed
+            # Multiple JARs - use classpath with main class
             classpath = os.pathsep.join(jar_files_clean)
-            print(f"Found {len(jar_files_clean)} JAR files, using explicit classpath")
+            print(f"Found {len(jar_files_clean)} JAR files, using classpath method")
             print(f"  Main JAR: {os.path.basename(mkgmap_jar_abs)}")
             print(f"  Dependencies: {len(jar_files_clean) - 1} JAR(s)")
             java_args = [
@@ -675,8 +677,8 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                 osm_path
             ]
         else:
-            # Single JAR - use -jar method
-            print(f"Using single JAR: {mkgmap_jar}")
+            # Single JAR - use -jar method (as per mkgmap documentation)
+            print(f"Using mkgmap.jar (standard method)")
             java_args = [
                 "java", "-jar", mkgmap_jar,
                 f"--output-dir={mkgmap_output_dir}",
