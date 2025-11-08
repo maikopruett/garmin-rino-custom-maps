@@ -362,7 +362,7 @@ def create_kmz(kml_path, image_path, output_kmz):
 
 def find_mkgmap_jar(mkgmap_path=None):
     """
-    Find mkgmap.jar file.
+    Find mkgmap.jar file in the project directory.
     
     Args:
         mkgmap_path: Optional user-specified path to mkgmap.jar
@@ -380,50 +380,15 @@ def find_mkgmap_jar(mkgmap_path=None):
         else:
             raise FileNotFoundError(f"mkgmap.jar not found at specified path: {mkgmap_path}")
     
-    current_dir = os.getcwd()
-    
     # Check current directory for mkgmap.jar
-    current_dir_jar = os.path.join(current_dir, "mkgmap.jar")
+    current_dir_jar = os.path.join(os.getcwd(), "mkgmap.jar")
     if os.path.exists(current_dir_jar):
         return current_dir_jar
     
-    # Check for mkgmap folders in current directory (common when unzipped)
-    # Look for folders starting with "mkgmap" (e.g., mkgmap-r4923, mkgmap-0.0.0, etc.)
-    if os.path.exists(current_dir):
-        for item in os.listdir(current_dir):
-            item_path = os.path.join(current_dir, item)
-            # Check if it's a directory starting with "mkgmap"
-            if os.path.isdir(item_path) and item.lower().startswith("mkgmap"):
-                # Look for mkgmap.jar inside this directory
-                jar_in_folder = os.path.join(item_path, "mkgmap.jar")
-                if os.path.exists(jar_in_folder):
-                    return jar_in_folder
-                # Also check for mkgmap.jar in subdirectories (some distributions have it nested)
-                for subitem in os.listdir(item_path):
-                    subitem_path = os.path.join(item_path, subitem)
-                    if os.path.isdir(subitem_path):
-                        nested_jar = os.path.join(subitem_path, "mkgmap.jar")
-                        if os.path.exists(nested_jar):
-                            return nested_jar
-    
-    # Check PATH
-    path_jar = shutil.which("mkgmap.jar")
-    if path_jar and os.path.exists(path_jar):
-        return path_jar
-    
-    # Check if mkgmap.jar is in PATH as a command (unlikely but possible)
-    mkgmap_cmd = shutil.which("mkgmap")
-    if mkgmap_cmd:
-        # If mkgmap command exists, check if it's a jar wrapper
-        # For now, we'll just raise an error and let user specify
-        pass
-    
     raise FileNotFoundError(
-        "mkgmap.jar not found. Please:\n"
-        "  1. Download mkgmap zip from https://www.mkgmap.org.uk/\n"
-        "  2. Unzip it in the current directory (it will create a folder like 'mkgmap-rXXXX')\n"
-        "  3. Or place mkgmap.jar directly in the current directory\n"
-        "  4. Or use --mkgmap-path to specify the location"
+        "mkgmap.jar not found in current directory. Please:\n"
+        "  1. Place mkgmap.jar in the project directory\n"
+        "  2. Or use --mkgmap-path to specify the location"
     )
 
 
@@ -672,82 +637,36 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                 "Java runtime not found. Please install Java (JRE) to use IMG conversion."
             )
         
-        # Build classpath for mkgmap - check for additional JAR dependencies
-        mkgmap_dir = os.path.dirname(os.path.abspath(mkgmap_jar))
-        mkgmap_jar_name = os.path.basename(mkgmap_jar)
-        
-        # Collect all JAR files in the mkgmap directory
-        jar_files = [os.path.abspath(mkgmap_jar)]
-        jar_paths_set = {os.path.abspath(mkgmap_jar)}
-        
-        if os.path.exists(mkgmap_dir):
-            # Check mkgmap directory for JAR files
-            for file in os.listdir(mkgmap_dir):
-                if file.endswith('.jar') and file != mkgmap_jar_name:
-                    jar_path = os.path.abspath(os.path.join(mkgmap_dir, file))
-                    if os.path.isfile(jar_path) and jar_path not in jar_paths_set:
-                        jar_files.append(jar_path)
-                        jar_paths_set.add(jar_path)
-            
-            # Check for lib subdirectory (common pattern)
-            lib_dir = os.path.join(mkgmap_dir, "lib")
-            if os.path.exists(lib_dir) and os.path.isdir(lib_dir):
-                for file in os.listdir(lib_dir):
-                    if file.endswith('.jar'):
-                        jar_path = os.path.abspath(os.path.join(lib_dir, file))
-                        if jar_path not in jar_paths_set:
-                            jar_files.append(jar_path)
-                            jar_paths_set.add(jar_path)
-        
-        # Also check current directory for common dependency names
+        # Build classpath for mkgmap - collect JAR files from project directory
         current_dir = os.getcwd()
-        common_deps = ['osmosis-core.jar', 'osmosis-pbf.jar', 'osmosis-xml.jar', 
-                       'osmosis-osm-binary.jar', 'osmosis-pbfmigrate.jar']
-        for dep in common_deps:
-            dep_path = os.path.join(current_dir, dep)
-            if os.path.exists(dep_path):
-                dep_abs_path = os.path.abspath(dep_path)
-                if dep_abs_path not in jar_paths_set:
-                    jar_files.append(dep_abs_path)
-                    jar_paths_set.add(dep_abs_path)
+        mkgmap_jar_abs = os.path.abspath(mkgmap_jar)
+        
+        # Start with mkgmap.jar
+        jar_files = [mkgmap_jar_abs]
+        jar_paths_set = {mkgmap_jar_abs}
         
         # Check for lib directory in current directory
-        current_lib_dir = os.path.join(current_dir, "lib")
-        if os.path.exists(current_lib_dir) and os.path.isdir(current_lib_dir):
-            for file in os.listdir(current_lib_dir):
+        lib_dir = os.path.join(current_dir, "lib")
+        if os.path.exists(lib_dir) and os.path.isdir(lib_dir):
+            for file in os.listdir(lib_dir):
                 if file.endswith('.jar'):
-                    jar_path = os.path.abspath(os.path.join(current_lib_dir, file))
+                    jar_path = os.path.abspath(os.path.join(lib_dir, file))
                     if jar_path not in jar_paths_set:
                         jar_files.append(jar_path)
                         jar_paths_set.add(jar_path)
         
         # Build Java command
-        mkgmap_jar_abs = os.path.abspath(mkgmap_jar)
-        mkgmap_dir = os.path.dirname(mkgmap_jar_abs)
+        # Ensure mkgmap.jar is first in the classpath (required for main class lookup)
+        # Remove duplicates and ensure mkgmap.jar is first
+        jar_files_clean = [j for j in jar_files if j != mkgmap_jar_abs]
+        jar_files_clean.insert(0, mkgmap_jar_abs)
         
-        # Check if there's a lib directory next to mkgmap.jar
-        lib_dir = os.path.join(mkgmap_dir, "lib")
-        has_lib_dir = os.path.exists(lib_dir) and os.path.isdir(lib_dir)
-        
-        if has_lib_dir and len(jar_files) > 1:
-            # Use wildcard classpath for lib directory (works on Unix/macOS)
-            # This is more reliable than listing all JARs individually
-            classpath = f"{mkgmap_jar_abs}{os.pathsep}{lib_dir}/*"
-            print(f"Found mkgmap.jar with lib directory, using wildcard classpath")
-            java_args = [
-                "java", "-cp", classpath,
-                "uk.me.parabola.mkgmap.Main",
-                f"--output-dir={mkgmap_output_dir}",
-                f"--mapname={mapname}",
-                osm_path
-            ]
-        elif len(jar_files) > 1:
-            # Multiple JARs - use explicit classpath
-            # Ensure mkgmap.jar is first (required for main class lookup)
-            jar_files = [j for j in jar_files if j != mkgmap_jar_abs]
-            jar_files.insert(0, mkgmap_jar_abs)
-            classpath = os.pathsep.join(jar_files)
-            print(f"Found {len(jar_files)} JAR files, using explicit classpath")
+        if len(jar_files_clean) > 1:
+            # Multiple JARs - use explicit classpath with all JARs listed
+            classpath = os.pathsep.join(jar_files_clean)
+            print(f"Found {len(jar_files_clean)} JAR files, using explicit classpath")
+            print(f"  Main JAR: {os.path.basename(mkgmap_jar_abs)}")
+            print(f"  Dependencies: {len(jar_files_clean) - 1} JAR(s)")
             java_args = [
                 "java", "-cp", classpath,
                 "uk.me.parabola.mkgmap.Main",
