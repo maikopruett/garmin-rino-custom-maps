@@ -747,13 +747,84 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
             shutil.rmtree(temp_dir)
 
 
+def find_tif_files(directory):
+    """
+    Find all TIF/TIFF files in the specified directory.
+    
+    Args:
+        directory: Directory to search for TIF files
+        
+    Returns:
+        List of paths to TIF files
+    """
+    tif_files = []
+    if not os.path.exists(directory) or not os.path.isdir(directory):
+        return tif_files
+    
+    for file in os.listdir(directory):
+        file_lower = file.lower()
+        if file_lower.endswith('.tif') or file_lower.endswith('.tiff'):
+            full_path = os.path.join(directory, file)
+            if os.path.isfile(full_path):
+                tif_files.append(full_path)
+    
+    return sorted(tif_files)
+
+
+def select_tif_file_interactive(main_folder):
+    """
+    Display TIF files in the main folder and allow user to select one.
+    
+    Args:
+        main_folder: Directory to search for TIF files
+        
+    Returns:
+        Path to selected TIF file, or None if cancelled
+    """
+    tif_files = find_tif_files(main_folder)
+    
+    if not tif_files:
+        print(f"No TIF files found in {main_folder}")
+        return None
+    
+    print(f"\nFound {len(tif_files)} TIF file(s) in {main_folder}:\n")
+    for i, tif_file in enumerate(tif_files, 1):
+        filename = os.path.basename(tif_file)
+        file_size = os.path.getsize(tif_file)
+        size_mb = file_size / (1024 * 1024)
+        print(f"  {i}) {filename} ({size_mb:.2f} MB)")
+    
+    print()
+    while True:
+        try:
+            user_input = input(f"Select a file (1-{len(tif_files)}) or 'q' to quit: ").strip()
+            if user_input.lower() == 'q':
+                print("Cancelled.")
+                return None
+            
+            try:
+                selection = int(user_input)
+                if 1 <= selection <= len(tif_files):
+                    selected_file = tif_files[selection - 1]
+                    print(f"Selected: {os.path.basename(selected_file)}\n")
+                    return selected_file
+                else:
+                    print(f"Invalid selection. Please enter a number between 1 and {len(tif_files)}.")
+            except ValueError:
+                print("Invalid input. Please enter a number or 'q' to quit.")
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Convert GeoTIFF files to Garmin-compatible KMZ or IMG files'
     )
     parser.add_argument(
         'input',
-        help='Path to input GeoTIFF file'
+        nargs='?',
+        help='Path to input GeoTIFF file (optional - if not provided, will search for TIF files in the main folder)'
     )
     parser.add_argument(
         '-o', '--output',
@@ -778,6 +849,18 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # If no input file provided, search for TIF files in the main folder
+    if args.input is None:
+        # Get the directory where the script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir == '':
+            script_dir = os.getcwd()
+        
+        selected_file = select_tif_file_interactive(script_dir)
+        if selected_file is None:
+            return 1
+        args.input = selected_file
     
     # Validate input file
     if not os.path.exists(args.input):
