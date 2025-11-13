@@ -18,6 +18,37 @@ from osgeo import osr
 from osgeo import ogr
 from xml.etree import ElementTree as ET
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_TEMP_ROOT = SCRIPT_DIR / ".garmin_temp"
+
+
+def _ensure_project_temp_root():
+    PROJECT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    return PROJECT_TEMP_ROOT
+
+
+def create_project_temp_dir(prefix):
+    """
+    Create a temporary directory inside the project folder instead of /var.
+    """
+    temp_root = _ensure_project_temp_root()
+    return tempfile.mkdtemp(prefix=prefix, dir=str(temp_root))
+
+
+def create_project_temp_file(prefix, suffix=".tmp", mode="w+", encoding="utf-8"):
+    """
+    Create a temporary file inside the project folder.
+    """
+    temp_root = _ensure_project_temp_root()
+    return tempfile.NamedTemporaryFile(
+        mode=mode,
+        encoding=encoding,
+        delete=False,
+        dir=str(temp_root),
+        prefix=prefix,
+        suffix=suffix
+    )
+
 # Suppress GDAL warning about UseExceptions
 gdal.UseExceptions()
 
@@ -787,7 +818,7 @@ def shapefile_to_osm(shapefile_path, osm_path, max_workers=None):
         text = f"{value:.10f}".rstrip('0').rstrip('.')
         return text if text else "0"
     
-    ways_temp = tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False, prefix="garmin_osm_ways_", suffix=".tmp")
+    ways_temp = create_project_temp_file(prefix="garmin_osm_ways_", suffix=".tmp")
     ways_temp_path = ways_temp.name
     
     try:
@@ -898,7 +929,7 @@ def shapefile_to_osm(shapefile_path, osm_path, max_workers=None):
     print(f"Successfully created OSM file at {osm_path}")
 
 
-def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
+def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None, java_max_memory=None):
     """
     Run mkgmap to generate all map files (.img, .tdb, .typ, .mdx) needed for GMAPI.
     
@@ -906,6 +937,7 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
         input_tif: Path to input GeoTIFF file
         mkgmap_output_dir: Directory where mkgmap should write output files
         mkgmap_path: Optional path to mkgmap.jar (will auto-detect if not provided)
+        java_max_memory: Optional string to pass to Java -Xmx (examples: '6G', '8192m')
         
     Returns:
         dict: Dictionary with paths to generated files and mapname
@@ -914,7 +946,7 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
     mkgmap_jar = find_mkgmap_jar(mkgmap_path)
     
     # Create temporary directory for intermediate files
-    temp_dir = tempfile.mkdtemp(prefix="garmin_gmapi_")
+    temp_dir = create_project_temp_dir("garmin_gmapi_")
     
     try:
         base_name = os.path.splitext(os.path.basename(input_tif))[0]
@@ -985,8 +1017,11 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
                         jar_paths_set.add(jar_path)
         
         # Build Java command - use --tdbfile and other options to ensure all files are generated
-        java_args_jar = [
-            "java", "-jar", mkgmap_jar,
+        java_base = ["java"]
+        if java_max_memory:
+            java_base.append(f"-Xmx{java_max_memory}")
+        java_args_jar = java_base + [
+            "-jar", mkgmap_jar,
             f"--output-dir={mkgmap_output_dir}",
             f"--mapname={mapname}",
             f"--tdbfile={base_name}.tdb",
@@ -1007,8 +1042,8 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
                 jar_files_clean = [j for j in jar_files if j != mkgmap_jar_abs]
                 jar_files_clean.insert(0, mkgmap_jar_abs)
                 classpath = os.pathsep.join(jar_files_clean)
-                java_args_cp = [
-                    "java", "-cp", classpath,
+                java_args_cp = java_base + [
+                    "-cp", classpath,
                     "uk.me.parabola.mkgmap.Main",
                     f"--output-dir={mkgmap_output_dir}",
                     f"--mapname={mapname}",
@@ -1090,7 +1125,7 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
             shutil.rmtree(temp_dir)
 
 
-def tif_to_img(input_tif, output_path, mkgmap_path=None):
+def tif_to_img(input_tif, output_path, mkgmap_path=None, java_max_memory=None):
     """
     Convert GeoTIFF to Garmin IMG format using gdal_polygonize and mkgmap.
     
@@ -1098,6 +1133,7 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
         input_tif: Path to input GeoTIFF file
         output_path: Path to output IMG file
         mkgmap_path: Optional path to mkgmap.jar (will auto-detect if not provided)
+        java_max_memory: Optional string for Java -Xmx (e.g., '4G')
         
     Returns:
         Path to the created IMG file
@@ -1106,7 +1142,7 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
     mkgmap_jar = find_mkgmap_jar(mkgmap_path)
     
     # Create temporary directory for intermediate files
-    temp_dir = tempfile.mkdtemp(prefix="garmin_img_")
+    temp_dir = create_project_temp_dir("garmin_img_")
     
     try:
         base_name = os.path.splitext(os.path.basename(input_tif))[0]
@@ -1184,8 +1220,11 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
         
         # First try the standard -jar method (works even with dependencies in lib/)
         print(f"Using mkgmap.jar (standard method)")
-        java_args_jar = [
-            "java", "-jar", mkgmap_jar,
+        java_base = ["java"]
+        if java_max_memory:
+            java_base.append(f"-Xmx{java_max_memory}")
+        java_args_jar = java_base + [
+            "-jar", mkgmap_jar,
             f"--output-dir={mkgmap_output_dir}",
             f"--mapname={mapname}",
             osm_path
@@ -1207,8 +1246,8 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                 jar_files_clean = [j for j in jar_files if j != mkgmap_jar_abs]
                 jar_files_clean.insert(0, mkgmap_jar_abs)
                 classpath = os.pathsep.join(jar_files_clean)
-                java_args_cp = [
-                    "java", "-cp", classpath,
+                java_args_cp = java_base + [
+                    "-cp", classpath,
                     "uk.me.parabola.mkgmap.Main",
                     f"--output-dir={mkgmap_output_dir}",
                     f"--mapname={mapname}",
@@ -1275,7 +1314,8 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
 
 
 def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None, 
-                  family_id=None, product_id=1, data_version="27", create_zip=False):
+                  family_id=None, product_id=1, data_version="27", create_zip=False,
+                  java_max_memory=None):
     """
     Convert GeoTIFF to Garmin GMAPI format (BaseCamp-compatible).
     
@@ -1288,6 +1328,7 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         product_id: Product ID (default: 1)
         data_version: Data version string (default: "27")
         create_zip: If True, create a .gmapi.zip file instead of directory
+        java_max_memory: Optional string for Java -Xmx (e.g., '6G')
         
     Returns:
         Path to the created GMAPI directory or file
@@ -1326,12 +1367,12 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         family_id = int(hash_hex[:8], 16) % 100000000  # Ensure it's 8 digits max
     
     # Create temporary directory for mkgmap output
-    temp_mkgmap_dir = tempfile.mkdtemp(prefix="mkgmap_gmapi_")
+    temp_mkgmap_dir = create_project_temp_dir("mkgmap_gmapi_")
     
     try:
         # Run mkgmap to generate all map files
         print("Generating map files with mkgmap...")
-        generated_files = run_mkgmap_for_gmapi(input_tif, temp_mkgmap_dir, mkgmap_path)
+        generated_files = run_mkgmap_for_gmapi(input_tif, temp_mkgmap_dir, mkgmap_path, java_max_memory)
         
         # Copy map tiles and support files to Product1 directory
         print("Packaging GMAPI files...")
@@ -1526,6 +1567,11 @@ def main():
         help='Temporary directory for intermediate files (default: system temp)',
         default=None
     )
+    parser.add_argument(
+        '--java-max-memory',
+        default='4G',
+        help="Maximum Java heap size passed to mkgmap via -Xmx (examples: '4G', '8192m')."
+    )
     
     args = parser.parse_args()
     
@@ -1586,7 +1632,7 @@ def main():
         # Create temporary directory
         temp_dir = args.temp_dir
         if temp_dir is None:
-            temp_dir = tempfile.mkdtemp(prefix="garmin_converter_")
+            temp_dir = create_project_temp_dir("garmin_converter_")
             cleanup_temp = True
         else:
             os.makedirs(temp_dir, exist_ok=True)
@@ -1622,7 +1668,7 @@ def main():
     elif conversion_type == 'img':
         # IMG conversion
         try:
-            tif_to_img(args.input, args.output, args.mkgmap_path)
+            tif_to_img(args.input, args.output, args.mkgmap_path, args.java_max_memory)
             return 0
         except Exception as e:
             print(f"Error: {str(e)}")
@@ -1631,7 +1677,7 @@ def main():
     elif conversion_type == 'gmapi':
         # GMAPI conversion (BaseCamp-compatible)
         try:
-            tif_to_gmapi(args.input, args.output, args.mkgmap_path)
+            tif_to_gmapi(args.input, args.output, args.mkgmap_path, java_max_memory=args.java_max_memory)
             return 0
         except Exception as e:
             print(f"Error: {str(e)}")

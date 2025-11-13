@@ -20,13 +20,19 @@ A Python tool to convert GeoTIFF files into Garmin-compatible KMZ or IMG files f
 - Uses mkgmap to create native Garmin IMG files
 - Produces IMG files that can be directly loaded onto Garmin devices
 
+### Option 3: GMAPI/BaseCamp Conversion
+- Streams huge datasets through GDAL → OSM without loading everything into memory
+- Runs mkgmap to build BaseCamp-ready GMAPI bundles (IMG + TDB/MDX/TYP)
+- Packages outputs inside a `Product1` folder, optionally zipped for easy install
+- Stores all intermediate artifacts inside `.garmin_temp/` in the project root for inspection
+
 ## Requirements
 
 ### For Both Conversion Types
 - Python 3.6 or higher
 - GDAL library (includes coordinate transformation and image resizing capabilities - see installation instructions below)
 
-### Additional Requirements for IMG Conversion
+### Additional Requirements for IMG & GMAPI Conversion
 - Java Runtime Environment (JRE) - required to run mkgmap.jar
 - mkgmap.jar - download from [mkgmap.org.uk](https://www.mkgmap.org.uk/)
 
@@ -106,11 +112,12 @@ python garmin-map-converter.py input.tif
 
 You'll see:
 ```
-Select conversion type: 1) KMZ  2) IMG [1]:
+Select conversion type: 1) KMZ  2) IMG  3) GMAPI [1]:
 ```
 
 - Press Enter or type `1` for KMZ conversion
 - Type `2` for IMG conversion
+- Type `3` for GMAPI/BaseCamp packages
 
 ### KMZ Conversion
 
@@ -141,6 +148,15 @@ python garmin-map-converter.py input.tif
 
 This will create `input.img` in the same directory as the input file.
 
+### GMAPI/BaseCamp Conversion
+
+Build a BaseCamp-installable GMAPI bundle:
+```bash
+python garmin-map-converter.py input.tif --type gmapi
+```
+
+The default output is `input.gmapi/` beside your source TIF (or `input.gmapi.zip` if you pass `--output some-name.gmapi.zip`). This contains the IMG tile plus `Product1/`, `MapProduct.xml`, and any `.tdb/.mdx/.typ` files mkgmap generates.
+
 ### Specify Output File
 
 For KMZ conversion:
@@ -151,6 +167,13 @@ python garmin-map-converter.py input.tif --type kmz -o output.kmz
 For IMG conversion:
 ```bash
 python garmin-map-converter.py input.tif --type img -o output.img
+```
+
+For GMAPI conversion:
+```bash
+python garmin-map-converter.py input.tif --type gmapi -o MyMap.gmapi
+# or zip format:
+python garmin-map-converter.py input.tif --type gmapi -o MyMap.gmapi.zip
 ```
 
 ### Specify mkgmap.jar Location
@@ -170,10 +193,13 @@ optional arguments:
   -h, --help            Show help message and exit
   -o OUTPUT, --output OUTPUT
                         Path to output file (default: input filename with .kmz or .img extension)
-  --type {kmz,img}      Conversion type: kmz or img (if not provided, will prompt interactively)
+  --type {kmz,img,gmapi}
+                        Conversion type (if not provided, will prompt interactively)
   --mkgmap-path MKGMAP_PATH
                         Path to mkgmap.jar (required for IMG conversion, will auto-detect if not provided)
-  --temp-dir TEMP_DIR   Temporary directory for intermediate files (default: system temp)
+  --temp-dir TEMP_DIR   Temporary directory for intermediate files (default: project/.garmin_temp)
+  --java-max-memory JAVA_MAX_MEMORY
+                        Maximum Java heap passed to mkgmap via -Xmx (default: 4G)
 ```
 
 ## How It Works
@@ -225,6 +251,12 @@ The generated IMG file is a native Garmin map file that can be:
 - Used with Garmin MapSource or other Garmin mapping software
 
 The IMG file uses a unique mapname (8-digit numeric ID) derived from the input filename to ensure compatibility with Garmin devices.
+
+## Temporary Files & Inspection
+
+- By default the converter now creates all intermediate shapefiles/OSM/IMG artifacts inside `.garmin_temp/` in the project root (instead of `/var/...`).  
+- You can inspect failures by opening that folder; each run gets its own prefixed subdirectory.  
+- Provide `--temp-dir /custom/path` if you want to override the location, or delete `.garmin_temp/` whenever you want to reclaim space.
 
 ## Coordinate System Support
 
@@ -282,6 +314,7 @@ If mkgmap fails during conversion:
 - Check that your GeoTIFF has valid georeferencing information
 - Verify the OSM file was created successfully (check temp directory if using `--temp-dir`)
 - Some complex GeoTIFF files may need preprocessing before conversion
+- If you see `java.lang.OutOfMemoryError` or `GC overhead limit exceeded`, rerun with a higher heap limit, e.g. `--java-max-memory 8G`
 
 ## License
 
