@@ -415,23 +415,20 @@ def generate_mapname(input_filename):
     return numeric_id.zfill(8)
 
 
-def _process_feature_batch(args):
+def _process_feature_batch(feature_data_batch, transform_wkt):
     """
-    Process a batch of features and return OSM XML elements.
-    This function is designed to be called by multiprocessing.
+    Process a batch of features and return simplified way coordinate data.
+    Designed for multiprocessing without managing global node/way IDs.
     
     Args:
-        args: Tuple of (feature_data_batch, start_node_id, start_way_id, transform_wkt)
-            feature_data_batch: List of feature data dicts with geometry coordinates
-            start_node_id: Starting node ID for this batch
-            start_way_id: Starting way ID for this batch
-            transform_wkt: WKT string for coordinate transformation (or None)
+        feature_data_batch: List of feature data dicts with geometry coordinates
+        transform_wkt: WKT string for coordinate transformation (or None)
     
     Returns:
-        Tuple of (nodes_list, ways_list, node_count, way_count)
+        List of dicts with keys:
+            - 'coords': list of (lon, lat) tuples
+            - 'is_area': bool indicating if geometry should be closed and tagged as area
     """
-    feature_data_batch, start_node_id, start_way_id, transform_wkt = args
-    
     # Set up coordinate transformation if needed
     transform = None
     if transform_wkt:
@@ -442,7 +439,7 @@ def _process_feature_batch(args):
             target_srs.ImportFromEPSG(4326)  # WGS84
             if not source_srs.IsSame(target_srs):
                 transform = osr.CoordinateTransformation(source_srs, target_srs)
-        except:
+        except Exception:
             transform = None
     
     def transform_point(x, y):
@@ -451,72 +448,34 @@ def _process_feature_batch(args):
             try:
                 lat, lon, _ = transform.TransformPoint(x, y)
                 return lon, lat
-            except:
+            except Exception:
                 return x, y
         return x, y
     
-    nodes_list = []
     ways_list = []
-    node_id = start_node_id
-    way_id = start_way_id
     
     for feature_data in feature_data_batch:
         geom_type = feature_data['type']
         geometries = feature_data['geometries']
+        is_area_geom = geom_type in ['polygon', 'multipolygon']
         
-        if geom_type in ['polygon', 'multipolygon']:
-            for geometry in geometries:
-                # geometry is a list of (x, y) tuples
-                if len(geometry) < 3:  # Need at least 3 points for a polygon
-                    continue
-                
-                node_ids = []
-                for x, y in geometry:
-                    lon, lat = transform_point(x, y)
-                    nodes_list.append({
-                        'id': node_id,
-                        'lat': lat,
-                        'lon': lon
-                    })
-                    node_ids.append(node_id)
-                    node_id += 1
-                
-                if len(node_ids) > 0:
-                    way_data = {
-                        'id': way_id,
-                        'nodes': node_ids,
-                        'is_area': True
-                    }
-                    ways_list.append(way_data)
-                    way_id += 1
-        
-        elif geom_type in ['linestring', 'multilinestring']:
-            for geometry in geometries:
-                # geometry is a list of (x, y) tuples
-                if len(geometry) < 2:  # Need at least 2 points for a linestring
-                    continue
-                
-                node_ids = []
-                for x, y in geometry:
-                    lon, lat = transform_point(x, y)
-                    nodes_list.append({
-                        'id': node_id,
-                        'lat': lat,
-                        'lon': lon
-                    })
-                    node_ids.append(node_id)
-                    node_id += 1
-                
-                if len(node_ids) > 1:
-                    way_data = {
-                        'id': way_id,
-                        'nodes': node_ids,
-                        'is_area': False
-                    }
-                    ways_list.append(way_data)
-                    way_id += 1
+        for geometry in geometries:
+            min_points = 3 if is_area_geom else 2
+            if len(geometry) < min_points:
+                continue
+            
+            coords = []
+            for x, y in geometry:
+                lon, lat = transform_point(x, y)
+                coords.append((lon, lat))
+            
+            if len(coords) >= min_points:
+                ways_list.append({
+                    'coords': coords,
+                    'is_area': is_area_geom
+                })
     
-    return nodes_list, ways_list, node_id - start_node_id, way_id - start_way_id
+    return ways_list
 
 
 def _extract_points_fast(geometry_obj):
@@ -648,20 +607,20 @@ def _process_geometry_batch(geometry_batch):
 
 def _extract_feature_data(shapefile_path, max_workers=None):
     """
-    Extract feature geometries from shapefile into simple data structures.
-    Uses multiprocessing to parallelize geometry extraction for better performance.
-    This allows safe multiprocessing without holding GDAL objects open across processes.
+    Extract feature geometries from a shapefile as a streaming generator.
+    Uses multiprocessing to parallelize geometry extraction without holding the
+    entire dataset in memory at once.
     
     Args:
         shapefile_path: Path to shapefile
         max_workers: Maximum number of worker processes (None = auto-detect CPU count)
     
     Returns:
-        Tuple of (feature_data_list, source_srs_wkt, feature_count)
+        Tuple of (feature_batch_iterator, source_srs_wkt, feature_count)
+            feature_batch_iterator: generator yielding lists of feature data dicts
     """
     import multiprocessing
     
-    # Auto-detect CPU count if not specified
     if max_workers is None:
         max_workers = max(1, multiprocessing.cpu_count())
     
@@ -677,116 +636,128 @@ def _extract_feature_data(shapefile_path, max_workers=None):
     source_srs = layer.GetSpatialRef()
     source_srs_wkt = source_srs.ExportToWkt() if source_srs else None
     
-    # Collect all geometries first (read sequentially for thread safety)
-    # We'll process them in parallel batches after serializing to WKB bytes
-    geometry_wkb_list = []
-    processed_features = 0
-    
-    # Batch size for parallel processing - larger batches reduce overhead
     batch_size = max(100, feature_count // (max_workers * 10)) if feature_count > 1000 else 50
-    
-    # Update progress every N features to reduce I/O overhead
     progress_interval = max(1, feature_count // 100) if feature_count > 1000 else 10
     
-    print(f"Reading features from shapefile (using {max_workers} processes for extraction)...")
-    
-    # Step 1: Read features sequentially and serialize geometries into batches
-    # OGR datasources are not thread-safe, so we must read sequentially
-    feature = layer.GetNextFeature()
-    while feature is not None:
-        geometry_ref = feature.GetGeometryRef()
+    def feature_batch_iterator():
+        nonlocal datasource
         
-        if geometry_ref is None:
-            feature = None
-            processed_features += 1
-            if feature_count > 0 and (processed_features % progress_interval == 0 or processed_features == feature_count):
-                progress = (processed_features / feature_count) * 100
-                sys.stdout.write(f"\rReading features: {processed_features}/{feature_count} ({progress:.1f}%)")
-                sys.stdout.flush()
+        geometry_batch = []
+        processed_features = 0
+        processed_geometries = 0
+        total_geometries = 0
+        processed_batches = 0
+        batch_index = 0
+        next_batch_to_yield = 0
+        
+        pending_results = {}
+        
+        outstanding_limit = max(2, max_workers * 2)
+        
+        print(f"Reading features from shapefile (using {max_workers} processes for extraction)...")
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            
+            def submit_current_batch():
+                nonlocal geometry_batch, batch_index, total_geometries
+                if not geometry_batch:
+                    return
+                batch = geometry_batch
+                geometry_batch = []
+                batch_len = len(batch)
+                total_geometries += batch_len
+                future = executor.submit(_process_geometry_batch, batch)
+                futures[future] = (batch_index, batch_len)
+                batch_index += 1
+            
+            def drain_one():
+                nonlocal processed_geometries, processed_batches, next_batch_to_yield
+                if not futures:
+                    return
+                for future in as_completed(list(futures.keys())):
+                    batch_idx, batch_len = futures.pop(future)
+                    try:
+                        batch_results = future.result()
+                    except Exception as e:
+                        print(f"\nError processing batch: {e}")
+                        raise
+                    pending_results[batch_idx] = batch_results
+                    processed_batches += 1
+                    processed_geometries += batch_len
+                    
+                    if total_geometries > 0:
+                        geometry_progress = (processed_geometries / total_geometries) * 100
+                        batch_progress = (processed_batches / max(1, batch_index)) * 100
+                        sys.stdout.write(
+                            f"\rExtracting features: {processed_geometries}/{total_geometries} geometries "
+                            f"({geometry_progress:.1f}%) | {processed_batches}/{max(1, batch_index)} batches "
+                            f"({batch_progress:.1f}%)"
+                        )
+                        sys.stdout.flush()
+                    
+                    while next_batch_to_yield in pending_results:
+                        result = pending_results.pop(next_batch_to_yield)
+                        next_batch_to_yield += 1
+                        yield result
+                    break
+            
             feature = layer.GetNextFeature()
-            continue
-        
-        # Serialize geometry to WKB to decouple from GDAL objects
-        geometry_wkb = geometry_ref.ExportToWkb()
-        feature = None  # Release feature immediately
-        
-        geometry_wkb_list.append(bytes(geometry_wkb))
-        processed_features += 1
-        
-        # Update progress
-        if feature_count > 0 and (processed_features % progress_interval == 0 or processed_features == feature_count):
-            progress = (processed_features / feature_count) * 100
-            sys.stdout.write(f"\rReading features: {processed_features}/{feature_count} ({progress:.1f}%)")
-            sys.stdout.flush()
-        
-        feature = layer.GetNextFeature()
-    
-    print()  # New line after reading progress
-    
-    # Close datasource - we no longer need it
-    datasource = None
-    
-    if len(geometry_wkb_list) == 0:
-        return [], source_srs_wkt, feature_count
-    
-    # Step 2: Process geometries in parallel batches using ProcessPoolExecutor
-    total_geometries = len(geometry_wkb_list)
-    print(f"Processing {total_geometries} geometries using {max_workers} processes...")
-    feature_data_list = []
-    
-    # Split geometries into batches
-    batches = []
-    batch_sizes = []  # Track size of each batch for progress calculation
-    for i in range(0, len(geometry_wkb_list), batch_size):
-        batch = geometry_wkb_list[i:i + batch_size]
-        batches.append(batch)
-        batch_sizes.append(len(batch))
-    
-    processed_batches = 0
-    processed_geometries = 0
-    total_batches = len(batches)
-    
-    # Process batches in parallel, preserving order
-    batch_results_dict = {}
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all batches with their indices
-        future_to_index = {}
-        for batch_idx, batch in enumerate(batches):
-            future = executor.submit(_process_geometry_batch, batch)
-            future_to_index[future] = batch_idx
-        
-        # Collect results as they complete, but store by index to preserve order
-        for future in as_completed(future_to_index):
-            try:
-                batch_idx = future_to_index[future]
-                batch_results = future.result()
-                batch_results_dict[batch_idx] = batch_results
+            while feature is not None:
+                geometry_ref = feature.GetGeometryRef()
                 
-                processed_batches += 1
-                processed_geometries += batch_sizes[batch_idx]
-                batch_progress = (processed_batches / total_batches) * 100
-                geometry_progress = (processed_geometries / total_geometries) * 100
-                sys.stdout.write(
-                    f"\rExtracting features: {processed_geometries}/{total_geometries} geometries "
-                    f"({geometry_progress:.1f}%) | {processed_batches}/{total_batches} batches ({batch_progress:.1f}%)"
-                )
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"\nError processing batch: {e}")
-                raise
+                if geometry_ref is None:
+                    feature = None
+                    processed_features += 1
+                    if feature_count > 0 and (processed_features % progress_interval == 0 or processed_features == feature_count):
+                        progress = (processed_features / feature_count) * 100
+                        sys.stdout.write(f"\rReading features: {processed_features}/{feature_count} ({progress:.1f}%)")
+                        sys.stdout.flush()
+                    feature = layer.GetNextFeature()
+                    continue
+                
+                geometry_wkb = geometry_ref.ExportToWkb()
+                feature = None  # Release feature immediately
+                
+                geometry_batch.append(bytes(geometry_wkb))
+                processed_features += 1
+                
+                if feature_count > 0 and (processed_features % progress_interval == 0 or processed_features == feature_count):
+                    progress = (processed_features / feature_count) * 100
+                    sys.stdout.write(f"\rReading features: {processed_features}/{feature_count} ({progress:.1f}%)")
+                    sys.stdout.flush()
+                
+                if len(geometry_batch) >= batch_size:
+                    submit_current_batch()
+                    if len(futures) >= outstanding_limit:
+                        yield from drain_one()
+                
+                feature = layer.GetNextFeature()
+            
+            print()  # New line after reading progress
+            
+            # Submit any remaining geometries
+            submit_current_batch()
+            
+            if batch_index > 0:
+                print(f"Processing geometries using {max_workers} processes...")
+            
+            # Drain all remaining futures
+            while futures:
+                yield from drain_one()
+            
+            print()  # New line after extraction progress
+        
+        datasource = None
     
-    # Combine results in order
-    for batch_idx in sorted(batch_results_dict.keys()):
-        feature_data_list.extend(batch_results_dict[batch_idx])
-    
-    print()  # New line after progress
-    return feature_data_list, source_srs_wkt, feature_count
+    return feature_batch_iterator(), source_srs_wkt, feature_count
 
 
 def shapefile_to_osm(shapefile_path, osm_path, max_workers=None):
     """
     Convert Shapefile to OSM XML format using GDAL Python bindings.
-    Uses multiprocessing for faster conversion on large files.
+    Streams data through multiprocessing so that memory use stays bounded even
+    for extremely large datasets.
     
     Args:
         shapefile_path: Path to input Shapefile (.shp)
@@ -794,14 +765,14 @@ def shapefile_to_osm(shapefile_path, osm_path, max_workers=None):
         max_workers: Maximum number of worker processes (None = auto-detect CPU count)
     """
     import multiprocessing
+    import tempfile
     
     # Auto-detect CPU count if not specified
     if max_workers is None:
         max_workers = max(1, multiprocessing.cpu_count() - 1)
     
     print(f"Extracting features from shapefile...")
-    # Extract feature data (this is single-threaded but fast)
-    feature_data_list, source_srs_wkt, feature_count = _extract_feature_data(shapefile_path)
+    feature_batch_iter, source_srs_wkt, feature_count = _extract_feature_data(shapefile_path)
     
     if feature_count == 0:
         # Create empty OSM file
@@ -812,113 +783,119 @@ def shapefile_to_osm(shapefile_path, osm_path, max_workers=None):
         tree.write(osm_path, encoding="utf-8", xml_declaration=True)
         return
     
-    # Split features into batches for parallel processing
-    batch_size = max(100, feature_count // (max_workers * 4))  # At least 100 features per batch
-    batches = []
-    for i in range(0, len(feature_data_list), batch_size):
-        batches.append(feature_data_list[i:i + batch_size])
+    def format_coord(value):
+        text = f"{value:.10f}".rstrip('0').rstrip('.')
+        return text if text else "0"
     
-    print(f"Processing {feature_count} features in {len(batches)} batches using {max_workers} workers...")
+    ways_temp = tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False, prefix="garmin_osm_ways_", suffix=".tmp")
+    ways_temp_path = ways_temp.name
     
-    # Calculate starting IDs for each batch
-    # We need to estimate IDs, but we'll track actual counts per batch
-    batch_start_ids = []
-    current_node_id = 1
-    current_way_id = 1
-    
-    # Estimate IDs per batch (rough estimate - actual counts will be tracked)
-    for batch in batches:
-        batch_start_ids.append((current_node_id, current_way_id))
-        # Rough estimate: assume average 10 nodes and 1 way per feature
-        estimated_nodes = len(batch) * 10
-        estimated_ways = len(batch)
-        current_node_id += estimated_nodes
-        current_way_id += estimated_ways
-    
-    # Process batches in parallel
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all batches
-        future_to_batch = {}
-        for i, batch in enumerate(batches):
-            start_node_id, start_way_id = batch_start_ids[i]
-            future = executor.submit(_process_feature_batch, (batch, start_node_id, start_way_id, source_srs_wkt))
-            future_to_batch[future] = i
-        
-        # Collect results as they complete
-        batch_results = {}
-        processed_batches = 0
-        for future in as_completed(future_to_batch):
-            batch_idx = future_to_batch[future]
-            try:
-                nodes_list, ways_list, node_count, way_count = future.result()
-                batch_results[batch_idx] = (nodes_list, ways_list)
-                processed_batches += 1
-                progress = (processed_batches / len(batches)) * 100
-                sys.stdout.write(f"\rProcessing batches: {processed_batches}/{len(batches)} ({progress:.1f}%)")
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"\nError processing batch {batch_idx}: {e}")
-                raise
-    
-    print()  # New line after progress
-    
-    # Recalculate actual IDs and merge results in order
-    print("Building OSM XML structure...")
-    osm_root = ET.Element("osm", version="0.6", generator="garmin-map-converter")
-    
-    # Deduplicate nodes by coordinate and create ID mapping
-    node_coord_map = {}  # Map from (lon, lat) to sequential node ID
-    node_id_map = {}  # Map from batch node ID to sequential node ID
-    current_node_id = 1
-    current_way_id = 1
-    
-    # First pass: collect all nodes and deduplicate by coordinate
-    for batch_idx in sorted(batch_results.keys()):
-        nodes_list, ways_list = batch_results[batch_idx]
-        for node_data in nodes_list:
-            coord_key = (node_data['lon'], node_data['lat'])
-            old_id = node_data['id']
+    try:
+        with open(osm_path, "w", encoding="utf-8") as osm_file:
+            osm_file.write('<?xml version="1.0" encoding="utf-8"?>\n')
+            osm_file.write('<osm version="0.6" generator="garmin-map-converter">\n')
             
-            if coord_key not in node_coord_map:
-                # New unique coordinate - assign new ID
-                node_coord_map[coord_key] = current_node_id
-                node_id_map[old_id] = current_node_id
+            node_coord_map = {}
+            current_node_id = 1
+            current_way_id = 1
+            
+            def ensure_node_id(coord):
+                nonlocal current_node_id
+                if coord in node_coord_map:
+                    return node_coord_map[coord]
+                lon, lat = coord
+                node_id = current_node_id
+                node_coord_map[coord] = node_id
+                node_line = (
+                    f'  <node id="{node_id}" lat="{format_coord(lat)}" '
+                    f'lon="{format_coord(lon)}" />\n'
+                )
+                osm_file.write(node_line)
                 current_node_id += 1
-            else:
-                # Duplicate coordinate - reuse existing ID
-                node_id_map[old_id] = node_coord_map[coord_key]
+                return node_id
+            
+            processed_features = 0
+            outstanding_limit = max(2, max_workers * 2)
+            pending_batches = {}
+            next_batch_to_write = 0
+            
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                
+                def submit_batch(batch_idx, feature_batch):
+                    future = executor.submit(_process_feature_batch, feature_batch, source_srs_wkt)
+                    futures[future] = (batch_idx, len(feature_batch))
+                
+                def drain_one():
+                    nonlocal processed_features, next_batch_to_write, current_way_id
+                    if not futures:
+                        return
+                    for future in as_completed(list(futures.keys())):
+                        batch_idx, batch_len = futures.pop(future)
+                        try:
+                            batch_ways = future.result()
+                        except Exception as e:
+                            print(f"\nError processing batch {batch_idx}: {e}")
+                            raise
+                        pending_batches[batch_idx] = batch_ways
+                        processed_features += batch_len
+                        progress = (processed_features / feature_count) * 100 if feature_count else 100.0
+                        sys.stdout.write(
+                            f"\rConverting features to OSM: {processed_features}/{feature_count} ({progress:.1f}%)"
+                        )
+                        sys.stdout.flush()
+                        
+                        while next_batch_to_write in pending_batches:
+                            ways_list = pending_batches.pop(next_batch_to_write)
+                            next_batch_to_write += 1
+                            for way_data in ways_list:
+                                coords = way_data['coords']
+                                if way_data['is_area'] and len(coords) < 3:
+                                    continue
+                                if not way_data['is_area'] and len(coords) < 2:
+                                    continue
+                                
+                                node_ids = []
+                                for lon, lat in coords:
+                                    coord_key = (lon, lat)
+                                    node_ids.append(ensure_node_id(coord_key))
+                                
+                                if way_data['is_area'] and len(node_ids) > 2 and node_ids[0] != node_ids[-1]:
+                                    node_ids.append(node_ids[0])
+                                
+                                if len(node_ids) < 2:
+                                    continue
+                                
+                                ways_temp.write(f'  <way id="{current_way_id}">\n')
+                                for node_id in node_ids:
+                                    ways_temp.write(f'    <nd ref="{node_id}" />\n')
+                                if way_data['is_area'] and len(node_ids) > 2:
+                                    ways_temp.write('    <tag k="area" v="yes" />\n')
+                                ways_temp.write('  </way>\n')
+                                current_way_id += 1
+                        break
+                
+                for batch_idx, feature_batch in enumerate(feature_batch_iter):
+                    submit_batch(batch_idx, feature_batch)
+                    if len(futures) >= outstanding_limit:
+                        drain_one()
+                
+                while futures:
+                    drain_one()
+            
+            print()  # New line after progress meter
+            
+            ways_temp.flush()
+            ways_temp.seek(0)
+            shutil.copyfileobj(ways_temp, osm_file)
+            osm_file.write('</osm>\n')
     
-    # Second pass: add nodes to XML (only unique coordinates)
-    for coord_key, node_id in sorted(node_coord_map.items(), key=lambda x: x[1]):
-        lon, lat = coord_key
-        ET.SubElement(osm_root, "node",
-                     id=str(node_id),
-                     lat=str(lat),
-                     lon=str(lon))
+    finally:
+        ways_temp.close()
+        if os.path.exists(ways_temp_path):
+            os.remove(ways_temp_path)
     
-    # Third pass: add ways with remapped node IDs
-    for batch_idx in sorted(batch_results.keys()):
-        nodes_list, ways_list = batch_results[batch_idx]
-        for way_data in ways_list:
-            way_elem = ET.SubElement(osm_root, "way", id=str(current_way_id))
-            # Remap node IDs
-            remapped_nodes = [node_id_map[nid] for nid in way_data['nodes'] if nid in node_id_map]
-            for node_id in remapped_nodes:
-                ET.SubElement(way_elem, "nd", ref=str(node_id))
-            # Close polygon if it's an area
-            if way_data['is_area'] and len(remapped_nodes) > 2:
-                ET.SubElement(way_elem, "nd", ref=str(remapped_nodes[0]))
-                ET.SubElement(way_elem, "tag", k="area", v="yes")
-            current_way_id += 1
-    
-    # Write OSM XML to file
-    print("Writing OSM XML file...")
-    tree = ET.ElementTree(osm_root)
-    # ET.indent is available in Python 3.9+, use it if available
-    if hasattr(ET, 'indent'):
-        ET.indent(tree, space="  ")
-    tree.write(osm_path, encoding="utf-8", xml_declaration=True)
-    print(f"Successfully created OSM file with {len(osm_root.findall('.//node'))} nodes and {len(osm_root.findall('.//way'))} ways")
+    print(f"Successfully created OSM file at {osm_path}")
 
 
 def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
