@@ -1374,21 +1374,8 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         print("Generating map files with mkgmap...")
         generated_files = run_mkgmap_for_gmapi(input_tif, temp_mkgmap_dir, mkgmap_path, java_max_memory)
         
-        # Copy map tiles and support files to Product1 directory
+        # Copy map tiles and support files to appropriate locations
         print("Packaging GMAPI files...")
-        files_to_copy = []
-        if 'img' in generated_files:
-            files_to_copy.append(('img', generated_files['img'], generated_files['img_name']))
-        if 'tdb' in generated_files:
-            files_to_copy.append(('tdb', generated_files['tdb'], generated_files['tdb_name']))
-        if 'typ' in generated_files:
-            files_to_copy.append(('typ', generated_files['typ'], generated_files['typ_name']))
-        if 'mdx' in generated_files:
-            files_to_copy.append(('mdx', generated_files['mdx'], generated_files['mdx_name']))
-        
-        for file_type, source_path, dest_name in files_to_copy:
-            shutil.copy(source_path, subproduct_dir / dest_name)
-            print(f"  ✓ Copied {file_type.upper()} file: {dest_name}")
         
         # Determine file names for XML
         base_name = generated_files.get('base_name', os.path.splitext(os.path.basename(input_tif))[0])
@@ -1396,8 +1383,64 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         mdx_name = generated_files.get('mdx_name', f"{base_name}.mdx")
         typ_name = generated_files.get('typ_name', "100D8.TYP")
         
-        # Create MapProduct.xml
-        print("Creating MapProduct.xml...")
+        # BaseMap name should match the base part of TDB/MDX filenames (without extension)
+        # Extract base name from TDB filename (remove .tdb extension)
+        if tdb_name and tdb_name.endswith('.tdb'):
+            base_map_name = tdb_name[:-4]  # Remove .tdb extension
+        elif mdx_name and mdx_name.endswith('.mdx'):
+            base_map_name = mdx_name[:-4]  # Remove .mdx extension
+        else:
+            # Fallback: use base_name with spaces replaced by underscores
+            base_map_name = base_name.replace(" ", "_")
+        
+        # Copy .mdx and .typ files to root level (not Product1)
+        if 'mdx' in generated_files:
+            shutil.copy(generated_files['mdx'], output_dir / mdx_name)
+            print(f"  ✓ Copied MDX file to root: {mdx_name}")
+        
+        if 'typ' in generated_files:
+            shutil.copy(generated_files['typ'], output_dir / typ_name)
+            print(f"  ✓ Copied TYP file to root: {typ_name}")
+        
+        # Copy .tdb file to Product1 directory
+        if 'tdb' in generated_files:
+            shutil.copy(generated_files['tdb'], subproduct_dir / tdb_name)
+            print(f"  ✓ Copied TDB file to Product1: {tdb_name}")
+        
+        # Copy .img files to Product1 directory (if any)
+        if 'img' in generated_files:
+            shutil.copy(generated_files['img'], subproduct_dir / generated_files['img_name'])
+            print(f"  ✓ Copied IMG file to Product1: {generated_files['img_name']}")
+        
+        # Copy all other files and subdirectories from mkgmap output to Product1
+        # (excluding .mdx, .typ which go to root, and .tdb which we already copied)
+        mkgmap_output = Path(temp_mkgmap_dir)
+        excluded_files = set()
+        if 'mdx' in generated_files:
+            excluded_files.add(Path(generated_files['mdx']).name)
+        if 'typ' in generated_files:
+            excluded_files.add(Path(generated_files['typ']).name)
+        if 'tdb' in generated_files:
+            excluded_files.add(Path(generated_files['tdb']).name)
+        if 'img' in generated_files:
+            excluded_files.add(Path(generated_files['img']).name)
+        
+        # Copy all files and directories from mkgmap output
+        for item in mkgmap_output.iterdir():
+            item_name = item.name
+            if item_name not in excluded_files:
+                dest = subproduct_dir / item_name
+                if item.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.copytree(item, dest)
+                    print(f"  ✓ Copied directory to Product1: {item_name}/")
+                elif item.is_file():
+                    shutil.copy(item, dest)
+                    print(f"  ✓ Copied file to Product1: {item_name}")
+        
+        # Create Info.xml (not MapProduct.xml) at root level
+        print("Creating Info.xml...")
         root = ET.Element("MapProduct", xmlns="http://www.garmin.com/xmlschemas/MapProduct/v1")
         
         name_elem = ET.SubElement(root, "Name")
@@ -1421,19 +1464,48 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         sub_elem = ET.SubElement(root, "SubProduct")
         ET.SubElement(sub_elem, "Name").text = map_name
         ET.SubElement(sub_elem, "ID").text = str(product_id)
-        ET.SubElement(sub_elem, "BaseMap").text = map_name.replace(" ", "_")
+        ET.SubElement(sub_elem, "BaseMap").text = base_map_name
         ET.SubElement(sub_elem, "TDB").text = tdb_name
         ET.SubElement(sub_elem, "Directory").text = "Product1"
         
-        # Save XML
-        xml_path = output_dir / "MapProduct.xml"
+        # Save XML with formatting matching the example
+        xml_path = output_dir / "Info.xml"
         tree = ET.ElementTree(root)
         # ET.indent is available in Python 3.9+
         if hasattr(ET, 'indent'):
             ET.indent(tree, space="  ")
-        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+        # Write with XML declaration matching example format
+        tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
         
-        print(f"  ✓ Created MapProduct.xml")
+        # Post-process to match example formatting (add newlines between elements)
+        with open(xml_path, 'r', encoding='UTF-8') as f:
+            content = f.read()
+        
+        # Add newlines between major elements to match example format
+        # Replace closing/opening tag pairs with newlines
+        content = content.replace('</Name>\n    <DataVersion>', '</Name>\n\n  <DataVersion>')
+        content = content.replace('</DataVersion>\n    <DataFormat>', '</DataVersion>\n\n  <DataFormat>')
+        content = content.replace('</DataFormat>\n    <ID>', '</DataFormat>\n\n  <ID>')
+        content = content.replace('</ID>\n    <IDX>', '</ID>\n\n  <IDX>')
+        content = content.replace('</IDX>\n    <TYP>', '</IDX>\n\n  <TYP>')
+        content = content.replace('</TYP>\n    <SubProduct>', '</TYP>\n\n  <SubProduct>')
+        content = content.replace('</SubProduct>\n</MapProduct>', '</SubProduct>\n\n</MapProduct>')
+        
+        # Fix the opening tag if needed
+        content = content.replace('<MapProduct xmlns=', '\n<MapProduct xmlns=')
+        
+        # Add standalone="no" to XML declaration to match example
+        if 'standalone=' not in content:
+            content = content.replace('<?xml version="1.0" encoding="UTF-8"?>', 
+                                     '<?xml version="1.0" encoding="UTF-8" standalone="no" ?>')
+        
+        # Clean up any double newlines at the start
+        content = content.lstrip('\n')
+        
+        with open(xml_path, 'w', encoding='UTF-8') as f:
+            f.write(content)
+        
+        print(f"  ✓ Created Info.xml")
         
         # Optionally create zip file
         final_output = output_dir
