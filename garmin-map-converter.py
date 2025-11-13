@@ -1336,28 +1336,35 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
     import hashlib
     
     # Determine output directory
+    # The .gmapi directory should keep its extension (e.g., "Northwest Topos.gmapi")
     if output_path.endswith('.gmapi.zip'):
-        # Remove both .gmapi.zip extensions to get directory name
-        output_dir = Path(output_path[:-10])  # Remove '.gmapi.zip'
+        # For .gmapi.zip, create a directory with .gmapi extension first, then zip it
+        output_dir = Path(output_path[:-4])  # Remove '.zip', keep '.gmapi'
     elif output_path.endswith('.gmapi'):
-        # Remove .gmapi extension to get directory name
-        output_dir = Path(output_path[:-6])  # Remove '.gmapi'
-    else:
+        # Keep .gmapi extension for the directory name
         output_dir = Path(output_path)
+    else:
+        # If no extension specified, add .gmapi
+        output_dir = Path(output_path + '.gmapi')
     
     # Clean and create gmapi directory
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
     
-    # Create subproduct folder (Garmin expects "Product1")
-    subproduct_dir = output_dir / "Product1"
-    subproduct_dir.mkdir()
-    
     # Generate map name if not provided
     if map_name is None:
         base_name = os.path.splitext(os.path.basename(input_tif))[0]
         map_name = base_name.replace("_", " ").title()
+    
+    # Create .gmap directory inside .gmapi directory
+    # The .gmap directory name should match the map name (e.g., "Northwest Topos.gmap")
+    gmap_dir = output_dir / f"{map_name}.gmap"
+    gmap_dir.mkdir()
+    
+    # Create subproduct folder (Garmin expects "Product1") inside .gmap directory
+    subproduct_dir = gmap_dir / "Product1"
+    subproduct_dir.mkdir()
     
     # Generate family_id if not provided (8-digit number from filename hash)
     if family_id is None:
@@ -1393,14 +1400,14 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
             # Fallback: use base_name with spaces replaced by underscores
             base_map_name = base_name.replace(" ", "_")
         
-        # Copy .mdx and .typ files to root level (not Product1)
+        # Copy .mdx and .typ files to .gmap directory level (not Product1)
         if 'mdx' in generated_files:
-            shutil.copy(generated_files['mdx'], output_dir / mdx_name)
-            print(f"  ✓ Copied MDX file to root: {mdx_name}")
+            shutil.copy(generated_files['mdx'], gmap_dir / mdx_name)
+            print(f"  ✓ Copied MDX file to .gmap: {mdx_name}")
         
         if 'typ' in generated_files:
-            shutil.copy(generated_files['typ'], output_dir / typ_name)
-            print(f"  ✓ Copied TYP file to root: {typ_name}")
+            shutil.copy(generated_files['typ'], gmap_dir / typ_name)
+            print(f"  ✓ Copied TYP file to .gmap: {typ_name}")
         
         # Copy .tdb file to Product1 directory
         if 'tdb' in generated_files:
@@ -1439,7 +1446,7 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
                     shutil.copy(item, dest)
                     print(f"  ✓ Copied file to Product1: {item_name}")
         
-        # Create Info.xml (not MapProduct.xml) at root level
+        # Create Info.xml inside .gmap directory
         print("Creating Info.xml...")
         root = ET.Element("MapProduct", xmlns="http://www.garmin.com/xmlschemas/MapProduct/v1")
         
@@ -1468,8 +1475,8 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         ET.SubElement(sub_elem, "TDB").text = tdb_name
         ET.SubElement(sub_elem, "Directory").text = "Product1"
         
-        # Save XML with formatting matching the example
-        xml_path = output_dir / "Info.xml"
+        # Save XML with formatting matching the example (inside .gmap directory)
+        xml_path = gmap_dir / "Info.xml"
         tree = ET.ElementTree(root)
         # ET.indent is available in Python 3.9+
         if hasattr(ET, 'indent'):
@@ -1508,21 +1515,30 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         print(f"  ✓ Created Info.xml")
         
         # Optionally create zip file
+        # .gmapi = directory, .gmapi.zip = zip file containing the .gmapi directory
         final_output = output_dir
-        if create_zip or output_path.endswith('.gmapi.zip') or output_path.endswith('.gmapi'):
+        should_create_zip = create_zip or output_path.endswith('.gmapi.zip')
+        
+        if should_create_zip:
             print("Creating GMAPI archive...")
+            # Create zip file containing the .gmapi directory
+            # make_archive creates archive at base_name.format in root_dir
+            # We want to archive the .gmapi directory itself, so use base_dir parameter
             zip_path = Path(str(output_dir) + ".zip")
-            shutil.make_archive(str(output_dir), "zip", output_dir)
+            # Archive from parent directory, including the .gmapi directory itself
+            shutil.make_archive(
+                str(output_dir),  # base_name (without extension)
+                "zip",  # format
+                str(output_dir.parent),  # root_dir (parent of .gmapi)
+                output_dir.name  # base_dir (the .gmapi directory name)
+            )
+            
             if zip_path.exists():
-                # Rename to .gmapi or .gmapi.zip if requested
-                if output_path.endswith('.gmapi'):
-                    gmapi_path = Path(output_path)
-                    zip_path.rename(gmapi_path)
-                    final_output = gmapi_path
-                    print(f"  ✓ Created GMAPI package: {gmapi_path.resolve()}")
-                elif output_path.endswith('.gmapi.zip'):
+                # If output_path was .gmapi.zip, rename to match exactly
+                if output_path.endswith('.gmapi.zip'):
                     gmapi_zip_path = Path(output_path)
-                    zip_path.rename(gmapi_zip_path)
+                    if zip_path != gmapi_zip_path:
+                        zip_path.rename(gmapi_zip_path)
                     final_output = gmapi_zip_path
                     print(f"  ✓ Created GMAPI zip package: {gmapi_zip_path.resolve()}")
                 else:
