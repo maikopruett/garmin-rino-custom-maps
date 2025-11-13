@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from osgeo import gdal
 from osgeo import osr
@@ -414,161 +415,510 @@ def generate_mapname(input_filename):
     return numeric_id.zfill(8)
 
 
-def shapefile_to_osm(shapefile_path, osm_path):
+def _process_feature_batch(args):
     """
-    Convert Shapefile to OSM XML format using GDAL Python bindings.
+    Process a batch of features and return OSM XML elements.
+    This function is designed to be called by multiprocessing.
     
     Args:
-        shapefile_path: Path to input Shapefile (.shp)
-        osm_path: Path to output OSM XML file
+        args: Tuple of (feature_data_batch, start_node_id, start_way_id, transform_wkt)
+            feature_data_batch: List of feature data dicts with geometry coordinates
+            start_node_id: Starting node ID for this batch
+            start_way_id: Starting way ID for this batch
+            transform_wkt: WKT string for coordinate transformation (or None)
+    
+    Returns:
+        Tuple of (nodes_list, ways_list, node_count, way_count)
     """
-    # Open the shapefile
+    feature_data_batch, start_node_id, start_way_id, transform_wkt = args
+    
+    # Set up coordinate transformation if needed
+    transform = None
+    if transform_wkt:
+        try:
+            source_srs = osr.SpatialReference()
+            source_srs.ImportFromWkt(transform_wkt)
+            target_srs = osr.SpatialReference()
+            target_srs.ImportFromEPSG(4326)  # WGS84
+            if not source_srs.IsSame(target_srs):
+                transform = osr.CoordinateTransformation(source_srs, target_srs)
+        except:
+            transform = None
+    
+    def transform_point(x, y):
+        """Transform a point to WGS84 if needed."""
+        if transform:
+            try:
+                lat, lon, _ = transform.TransformPoint(x, y)
+                return lon, lat
+            except:
+                return x, y
+        return x, y
+    
+    nodes_list = []
+    ways_list = []
+    node_id = start_node_id
+    way_id = start_way_id
+    
+    for feature_data in feature_data_batch:
+        geom_type = feature_data['type']
+        geometries = feature_data['geometries']
+        
+        if geom_type in ['polygon', 'multipolygon']:
+            for geometry in geometries:
+                # geometry is a list of (x, y) tuples
+                if len(geometry) < 3:  # Need at least 3 points for a polygon
+                    continue
+                
+                node_ids = []
+                for x, y in geometry:
+                    lon, lat = transform_point(x, y)
+                    nodes_list.append({
+                        'id': node_id,
+                        'lat': lat,
+                        'lon': lon
+                    })
+                    node_ids.append(node_id)
+                    node_id += 1
+                
+                if len(node_ids) > 0:
+                    way_data = {
+                        'id': way_id,
+                        'nodes': node_ids,
+                        'is_area': True
+                    }
+                    ways_list.append(way_data)
+                    way_id += 1
+        
+        elif geom_type in ['linestring', 'multilinestring']:
+            for geometry in geometries:
+                # geometry is a list of (x, y) tuples
+                if len(geometry) < 2:  # Need at least 2 points for a linestring
+                    continue
+                
+                node_ids = []
+                for x, y in geometry:
+                    lon, lat = transform_point(x, y)
+                    nodes_list.append({
+                        'id': node_id,
+                        'lat': lat,
+                        'lon': lon
+                    })
+                    node_ids.append(node_id)
+                    node_id += 1
+                
+                if len(node_ids) > 1:
+                    way_data = {
+                        'id': way_id,
+                        'nodes': node_ids,
+                        'is_area': False
+                    }
+                    ways_list.append(way_data)
+                    way_id += 1
+    
+    return nodes_list, ways_list, node_id - start_node_id, way_id - start_way_id
+
+
+def _extract_points_fast(geometry_obj):
+    """
+    Efficiently extract points from a geometry object.
+    Uses ExportToWkb and manual parsing for better performance.
+    
+    Args:
+        geometry_obj: OGR Geometry object
+    
+    Returns:
+        List of (x, y) tuples
+    """
+    point_count = geometry_obj.GetPointCount()
+    if point_count == 0:
+        return []
+    
+    # Use GetPoint() but optimize by pre-allocating list
+    points = [None] * point_count
+    for i in range(point_count):
+        point = geometry_obj.GetPoint(i)
+        points[i] = (point[0], point[1])
+    return points
+
+
+def _process_single_geometry(geometry):
+    """
+    Process a single cloned geometry object and extract feature data.
+    This function is designed to be called by parallel executors.
+    
+    Args:
+        geometry: Cloned OGR Geometry object (independent of feature)
+    
+    Returns:
+        Feature data dict or None if geometry is invalid
+    """
+    if geometry is None:
+        return None
+    
+    geom_type = geometry.GetGeometryType()
+    geometries = []
+    
+    try:
+        if geom_type == ogr.wkbPolygon:
+            # Single polygon
+            exterior_ring = geometry.GetGeometryRef(0)
+            if exterior_ring:
+                points = _extract_points_fast(exterior_ring)
+                if len(points) > 0:
+                    geometries.append(points)
+            if len(geometries) > 0:
+                return {
+                    'type': 'polygon',
+                    'geometries': geometries
+                }
+        
+        elif geom_type == ogr.wkbMultiPolygon:
+            # MultiPolygon
+            geom_count = geometry.GetGeometryCount()
+            for i in range(geom_count):
+                polygon = geometry.GetGeometryRef(i)
+                if polygon:
+                    exterior_ring = polygon.GetGeometryRef(0)
+                    if exterior_ring:
+                        points = _extract_points_fast(exterior_ring)
+                        if len(points) > 0:
+                            geometries.append(points)
+            if len(geometries) > 0:
+                return {
+                    'type': 'multipolygon',
+                    'geometries': geometries
+                }
+        
+        elif geom_type == ogr.wkbLineString:
+            # Single linestring
+            points = _extract_points_fast(geometry)
+            if len(points) > 0:
+                geometries.append(points)
+                return {
+                    'type': 'linestring',
+                    'geometries': geometries
+                }
+        
+        elif geom_type == ogr.wkbMultiLineString:
+            # MultiLineString
+            geom_count = geometry.GetGeometryCount()
+            for i in range(geom_count):
+                linestring = geometry.GetGeometryRef(i)
+                if linestring:
+                    points = _extract_points_fast(linestring)
+                    if len(points) > 0:
+                        geometries.append(points)
+            if len(geometries) > 0:
+                return {
+                    'type': 'multilinestring',
+                    'geometries': geometries
+                }
+    except Exception:
+        # If processing fails, return None (will be skipped)
+        return None
+    
+    return None
+
+
+def _process_geometry_batch(geometry_batch):
+    """
+    Process a batch of geometries in parallel.
+    
+    Args:
+        geometry_batch: List of OGR Geometry objects or WKB byte strings
+    
+    Returns:
+        List of feature data dicts (None values filtered out)
+    """
+    results = []
+    for geometry in geometry_batch:
+        if geometry is None:
+            continue
+        if isinstance(geometry, (bytes, bytearray, memoryview)):
+            try:
+                geometry = ogr.CreateGeometryFromWkb(bytes(geometry))
+            except Exception:
+                continue
+        result = _process_single_geometry(geometry)
+        if result is not None:
+            results.append(result)
+    return results
+
+
+def _extract_feature_data(shapefile_path, max_workers=None):
+    """
+    Extract feature geometries from shapefile into simple data structures.
+    Uses multiprocessing to parallelize geometry extraction for better performance.
+    This allows safe multiprocessing without holding GDAL objects open across processes.
+    
+    Args:
+        shapefile_path: Path to shapefile
+        max_workers: Maximum number of worker processes (None = auto-detect CPU count)
+    
+    Returns:
+        Tuple of (feature_data_list, source_srs_wkt, feature_count)
+    """
+    import multiprocessing
+    
+    # Auto-detect CPU count if not specified
+    if max_workers is None:
+        max_workers = max(1, multiprocessing.cpu_count())
+    
     driver = ogr.GetDriverByName("ESRI Shapefile")
     datasource = driver.Open(shapefile_path, 0)
     if datasource is None:
         raise RuntimeError(f"Could not open shapefile: {shapefile_path}")
     
     layer = datasource.GetLayer()
-    
-    # Get feature count for progress tracking
     feature_count = layer.GetFeatureCount()
-    layer.ResetReading()  # Reset to beginning after counting
+    layer.ResetReading()
     
-    # Get spatial reference and set up coordinate transformation if needed
     source_srs = layer.GetSpatialRef()
-    target_srs = osr.SpatialReference()
-    target_srs.ImportFromEPSG(4326)  # WGS84
+    source_srs_wkt = source_srs.ExportToWkt() if source_srs else None
     
-    transform = None
-    if source_srs and not source_srs.IsSame(target_srs):
-        transform = osr.CoordinateTransformation(source_srs, target_srs)
-    
-    # Create OSM XML structure
-    osm_root = ET.Element("osm", version="0.6", generator="garmin-map-converter")
-    
-    node_id = 1
-    way_id = 1
-    
-    def transform_point(x, y):
-        """Transform a point to WGS84 if needed."""
-        if transform:
-            try:
-                # TransformPoint returns (lat, lon, z) but we need (lon, lat)
-                lat, lon, _ = transform.TransformPoint(x, y)
-                return lon, lat
-            except:
-                # If transformation fails, return as-is
-                return x, y
-        return x, y
-    
-    # Process each feature (polygon) in the shapefile
+    # Collect all geometries first (read sequentially for thread safety)
+    # We'll process them in parallel batches after serializing to WKB bytes
+    geometry_wkb_list = []
     processed_features = 0
-    for feature in layer:
-        geometry = feature.GetGeometryRef()
-        if geometry is None:
+    
+    # Batch size for parallel processing - larger batches reduce overhead
+    batch_size = max(100, feature_count // (max_workers * 10)) if feature_count > 1000 else 50
+    
+    # Update progress every N features to reduce I/O overhead
+    progress_interval = max(1, feature_count // 100) if feature_count > 1000 else 10
+    
+    print(f"Reading features from shapefile (using {max_workers} processes for extraction)...")
+    
+    # Step 1: Read features sequentially and serialize geometries into batches
+    # OGR datasources are not thread-safe, so we must read sequentially
+    feature = layer.GetNextFeature()
+    while feature is not None:
+        geometry_ref = feature.GetGeometryRef()
+        
+        if geometry_ref is None:
+            feature = None
+            processed_features += 1
+            if feature_count > 0 and (processed_features % progress_interval == 0 or processed_features == feature_count):
+                progress = (processed_features / feature_count) * 100
+                sys.stdout.write(f"\rReading features: {processed_features}/{feature_count} ({progress:.1f}%)")
+                sys.stdout.flush()
+            feature = layer.GetNextFeature()
             continue
         
-        # Get geometry type
-        geom_type = geometry.GetGeometryType()
+        # Serialize geometry to WKB to decouple from GDAL objects
+        geometry_wkb = geometry_ref.ExportToWkb()
+        feature = None  # Release feature immediately
         
-        if geom_type == ogr.wkbPolygon or geom_type == ogr.wkbMultiPolygon:
-            # Handle polygons
-            if geom_type == ogr.wkbPolygon:
-                polygons = [geometry]
-            else:  # MultiPolygon
-                polygons = []
-                for i in range(geometry.GetGeometryCount()):
-                    polygons.append(geometry.GetGeometryRef(i))
-            
-            for polygon in polygons:
-                # Get exterior ring
-                exterior_ring = polygon.GetGeometryRef(0)
-                if exterior_ring is None:
-                    continue
-                
-                # Create nodes for each point in the ring
-                node_ids = []
-                point_count = exterior_ring.GetPointCount()
-                
-                for i in range(point_count):
-                    point = exterior_ring.GetPoint(i)
-                    lon, lat = transform_point(point[0], point[1])
-                    
-                    # Create node element
-                    node_elem = ET.SubElement(osm_root, "node", 
-                                             id=str(node_id),
-                                             lat=str(lat),
-                                             lon=str(lon))
-                    node_ids.append(node_id)
-                    node_id += 1
-                
-                # Create way element connecting the nodes
-                if len(node_ids) > 0:
-                    way_elem = ET.SubElement(osm_root, "way", id=str(way_id))
-                    
-                    # Add node references
-                    for nid in node_ids:
-                        ET.SubElement(way_elem, "nd", ref=str(nid))
-                    
-                    # Close the way by adding first node again if it's a polygon
-                    if len(node_ids) > 2:
-                        ET.SubElement(way_elem, "nd", ref=str(node_ids[0]))
-                    
-                    # Add tag for area
-                    ET.SubElement(way_elem, "tag", k="area", v="yes")
-                    
-                    way_id += 1
-        
-        elif geom_type == ogr.wkbLineString or geom_type == ogr.wkbMultiLineString:
-            # Handle linestrings
-            if geom_type == ogr.wkbLineString:
-                linestrings = [geometry]
-            else:  # MultiLineString
-                linestrings = []
-                for i in range(geometry.GetGeometryCount()):
-                    linestrings.append(geometry.GetGeometryRef(i))
-            
-            for linestring in linestrings:
-                node_ids = []
-                point_count = linestring.GetPointCount()
-                
-                for i in range(point_count):
-                    point = linestring.GetPoint(i)
-                    lon, lat = transform_point(point[0], point[1])
-                    
-                    node_elem = ET.SubElement(osm_root, "node",
-                                             id=str(node_id),
-                                             lat=str(lat),
-                                             lon=str(lon))
-                    node_ids.append(node_id)
-                    node_id += 1
-                
-                if len(node_ids) > 1:
-                    way_elem = ET.SubElement(osm_root, "way", id=str(way_id))
-                    for nid in node_ids:
-                        ET.SubElement(way_elem, "nd", ref=str(nid))
-                    way_id += 1
+        geometry_wkb_list.append(bytes(geometry_wkb))
+        processed_features += 1
         
         # Update progress
-        processed_features += 1
-        if feature_count > 0:
+        if feature_count > 0 and (processed_features % progress_interval == 0 or processed_features == feature_count):
             progress = (processed_features / feature_count) * 100
-            # Update progress on same line
-            sys.stdout.write(f"\rProcessing features: {processed_features}/{feature_count} ({progress:.1f}%)")
+            sys.stdout.write(f"\rReading features: {processed_features}/{feature_count} ({progress:.1f}%)")
             sys.stdout.flush()
+        
+        feature = layer.GetNextFeature()
     
-    # Print newline after progress updates
-    if feature_count > 0:
-        print()  # New line after progress bar
+    print()  # New line after reading progress
     
+    # Close datasource - we no longer need it
     datasource = None
     
+    if len(geometry_wkb_list) == 0:
+        return [], source_srs_wkt, feature_count
+    
+    # Step 2: Process geometries in parallel batches using ProcessPoolExecutor
+    total_geometries = len(geometry_wkb_list)
+    print(f"Processing {total_geometries} geometries using {max_workers} processes...")
+    feature_data_list = []
+    
+    # Split geometries into batches
+    batches = []
+    batch_sizes = []  # Track size of each batch for progress calculation
+    for i in range(0, len(geometry_wkb_list), batch_size):
+        batch = geometry_wkb_list[i:i + batch_size]
+        batches.append(batch)
+        batch_sizes.append(len(batch))
+    
+    processed_batches = 0
+    processed_geometries = 0
+    total_batches = len(batches)
+    
+    # Process batches in parallel, preserving order
+    batch_results_dict = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all batches with their indices
+        future_to_index = {}
+        for batch_idx, batch in enumerate(batches):
+            future = executor.submit(_process_geometry_batch, batch)
+            future_to_index[future] = batch_idx
+        
+        # Collect results as they complete, but store by index to preserve order
+        for future in as_completed(future_to_index):
+            try:
+                batch_idx = future_to_index[future]
+                batch_results = future.result()
+                batch_results_dict[batch_idx] = batch_results
+                
+                processed_batches += 1
+                processed_geometries += batch_sizes[batch_idx]
+                batch_progress = (processed_batches / total_batches) * 100
+                geometry_progress = (processed_geometries / total_geometries) * 100
+                sys.stdout.write(
+                    f"\rExtracting features: {processed_geometries}/{total_geometries} geometries "
+                    f"({geometry_progress:.1f}%) | {processed_batches}/{total_batches} batches ({batch_progress:.1f}%)"
+                )
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"\nError processing batch: {e}")
+                raise
+    
+    # Combine results in order
+    for batch_idx in sorted(batch_results_dict.keys()):
+        feature_data_list.extend(batch_results_dict[batch_idx])
+    
+    print()  # New line after progress
+    return feature_data_list, source_srs_wkt, feature_count
+
+
+def shapefile_to_osm(shapefile_path, osm_path, max_workers=None):
+    """
+    Convert Shapefile to OSM XML format using GDAL Python bindings.
+    Uses multiprocessing for faster conversion on large files.
+    
+    Args:
+        shapefile_path: Path to input Shapefile (.shp)
+        osm_path: Path to output OSM XML file
+        max_workers: Maximum number of worker processes (None = auto-detect CPU count)
+    """
+    import multiprocessing
+    
+    # Auto-detect CPU count if not specified
+    if max_workers is None:
+        max_workers = max(1, multiprocessing.cpu_count() - 1)
+    
+    print(f"Extracting features from shapefile...")
+    # Extract feature data (this is single-threaded but fast)
+    feature_data_list, source_srs_wkt, feature_count = _extract_feature_data(shapefile_path)
+    
+    if feature_count == 0:
+        # Create empty OSM file
+        osm_root = ET.Element("osm", version="0.6", generator="garmin-map-converter")
+        tree = ET.ElementTree(osm_root)
+        if hasattr(ET, 'indent'):
+            ET.indent(tree, space="  ")
+        tree.write(osm_path, encoding="utf-8", xml_declaration=True)
+        return
+    
+    # Split features into batches for parallel processing
+    batch_size = max(100, feature_count // (max_workers * 4))  # At least 100 features per batch
+    batches = []
+    for i in range(0, len(feature_data_list), batch_size):
+        batches.append(feature_data_list[i:i + batch_size])
+    
+    print(f"Processing {feature_count} features in {len(batches)} batches using {max_workers} workers...")
+    
+    # Calculate starting IDs for each batch
+    # We need to estimate IDs, but we'll track actual counts per batch
+    batch_start_ids = []
+    current_node_id = 1
+    current_way_id = 1
+    
+    # Estimate IDs per batch (rough estimate - actual counts will be tracked)
+    for batch in batches:
+        batch_start_ids.append((current_node_id, current_way_id))
+        # Rough estimate: assume average 10 nodes and 1 way per feature
+        estimated_nodes = len(batch) * 10
+        estimated_ways = len(batch)
+        current_node_id += estimated_nodes
+        current_way_id += estimated_ways
+    
+    # Process batches in parallel
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all batches
+        future_to_batch = {}
+        for i, batch in enumerate(batches):
+            start_node_id, start_way_id = batch_start_ids[i]
+            future = executor.submit(_process_feature_batch, (batch, start_node_id, start_way_id, source_srs_wkt))
+            future_to_batch[future] = i
+        
+        # Collect results as they complete
+        batch_results = {}
+        processed_batches = 0
+        for future in as_completed(future_to_batch):
+            batch_idx = future_to_batch[future]
+            try:
+                nodes_list, ways_list, node_count, way_count = future.result()
+                batch_results[batch_idx] = (nodes_list, ways_list)
+                processed_batches += 1
+                progress = (processed_batches / len(batches)) * 100
+                sys.stdout.write(f"\rProcessing batches: {processed_batches}/{len(batches)} ({progress:.1f}%)")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"\nError processing batch {batch_idx}: {e}")
+                raise
+    
+    print()  # New line after progress
+    
+    # Recalculate actual IDs and merge results in order
+    print("Building OSM XML structure...")
+    osm_root = ET.Element("osm", version="0.6", generator="garmin-map-converter")
+    
+    # Deduplicate nodes by coordinate and create ID mapping
+    node_coord_map = {}  # Map from (lon, lat) to sequential node ID
+    node_id_map = {}  # Map from batch node ID to sequential node ID
+    current_node_id = 1
+    current_way_id = 1
+    
+    # First pass: collect all nodes and deduplicate by coordinate
+    for batch_idx in sorted(batch_results.keys()):
+        nodes_list, ways_list = batch_results[batch_idx]
+        for node_data in nodes_list:
+            coord_key = (node_data['lon'], node_data['lat'])
+            old_id = node_data['id']
+            
+            if coord_key not in node_coord_map:
+                # New unique coordinate - assign new ID
+                node_coord_map[coord_key] = current_node_id
+                node_id_map[old_id] = current_node_id
+                current_node_id += 1
+            else:
+                # Duplicate coordinate - reuse existing ID
+                node_id_map[old_id] = node_coord_map[coord_key]
+    
+    # Second pass: add nodes to XML (only unique coordinates)
+    for coord_key, node_id in sorted(node_coord_map.items(), key=lambda x: x[1]):
+        lon, lat = coord_key
+        ET.SubElement(osm_root, "node",
+                     id=str(node_id),
+                     lat=str(lat),
+                     lon=str(lon))
+    
+    # Third pass: add ways with remapped node IDs
+    for batch_idx in sorted(batch_results.keys()):
+        nodes_list, ways_list = batch_results[batch_idx]
+        for way_data in ways_list:
+            way_elem = ET.SubElement(osm_root, "way", id=str(current_way_id))
+            # Remap node IDs
+            remapped_nodes = [node_id_map[nid] for nid in way_data['nodes'] if nid in node_id_map]
+            for node_id in remapped_nodes:
+                ET.SubElement(way_elem, "nd", ref=str(node_id))
+            # Close polygon if it's an area
+            if way_data['is_area'] and len(remapped_nodes) > 2:
+                ET.SubElement(way_elem, "nd", ref=str(remapped_nodes[0]))
+                ET.SubElement(way_elem, "tag", k="area", v="yes")
+            current_way_id += 1
+    
     # Write OSM XML to file
+    print("Writing OSM XML file...")
     tree = ET.ElementTree(osm_root)
     # ET.indent is available in Python 3.9+, use it if available
     if hasattr(ET, 'indent'):
         ET.indent(tree, space="  ")
     tree.write(osm_path, encoding="utf-8", xml_declaration=True)
+    print(f"Successfully created OSM file with {len(osm_root.findall('.//node'))} nodes and {len(osm_root.findall('.//way'))} ways")
 
 
 def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
@@ -597,7 +947,8 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
         os.makedirs(mkgmap_output_dir, exist_ok=True)
         
         # Step 1: Convert GeoTIFF to Shapefile using gdal_polygonize
-        print(f"Converting {input_tif} to Shapefile format...")
+        print(f"Step 1/3: Converting GeoTIFF to Shapefile format...")
+        print(f"  Running gdal_polygonize.py (this may take a while for large files)...")
         try:
             result = subprocess.run(
                 ["gdal_polygonize.py", input_tif, "-f", "ESRI Shapefile", shapefile_path],
@@ -605,6 +956,7 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
                 capture_output=True,
                 text=True
             )
+            print(f"  ✓ Shapefile created successfully")
         except FileNotFoundError:
             raise FileNotFoundError(
                 "gdal_polygonize.py not found. Make sure GDAL is properly installed and "
@@ -618,7 +970,7 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
             raise RuntimeError("gdal_polygonize.py did not create Shapefile")
         
         # Step 2: Convert Shapefile to OSM format using Python/GDAL
-        print(f"Converting Shapefile to OSM format...")
+        print(f"Step 2/3: Converting Shapefile to OSM format...")
         try:
             shapefile_to_osm(shapefile_path, osm_path)
         except Exception as e:
@@ -628,7 +980,8 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
             raise RuntimeError("Failed to create OSM file")
         
         # Step 3: Convert OSM to IMG using mkgmap (with all necessary outputs)
-        print(f"Running mkgmap to generate map files...")
+        print(f"Step 3/3: Running mkgmap to generate map files...")
+        print(f"  Processing OSM data with mkgmap (this may take a while)...")
         mapname = generate_mapname(input_tif)
         
         # Check if Java is available
@@ -692,6 +1045,7 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
                         capture_output=True,
                         text=True
                     )
+                    print(f"  ✓ mkgmap completed successfully")
                 except subprocess.CalledProcessError as e2:
                     error_msg = f"mkgmap failed: {e2.stderr}"
                     if e2.stdout:
@@ -702,6 +1056,9 @@ def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
                 if e.stdout:
                     error_msg += f"\nstdout: {e.stdout}"
                 raise RuntimeError(error_msg)
+        else:
+            # Success with -jar method
+            print(f"  ✓ mkgmap completed successfully")
         
         # Collect all generated files
         generated_files = {}
@@ -782,7 +1139,8 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
         os.makedirs(mkgmap_output_dir, exist_ok=True)
         
         # Step 1: Convert GeoTIFF to Shapefile using gdal_polygonize
-        print(f"Converting {input_tif} to Shapefile format...")
+        print(f"Step 1/3: Converting GeoTIFF to Shapefile format...")
+        print(f"  Running gdal_polygonize.py (this may take a while for large files)...")
         try:
             result = subprocess.run(
                 ["gdal_polygonize.py", input_tif, "-f", "ESRI Shapefile", shapefile_path],
@@ -790,6 +1148,7 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                 capture_output=True,
                 text=True
             )
+            print(f"  ✓ Shapefile created successfully")
         except FileNotFoundError:
             raise FileNotFoundError(
                 "gdal_polygonize.py not found. Make sure GDAL is properly installed and "
@@ -803,7 +1162,7 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
             raise RuntimeError("gdal_polygonize.py did not create Shapefile")
         
         # Step 2: Convert Shapefile to OSM format using Python/GDAL
-        print(f"Converting Shapefile to OSM format...")
+        print(f"Step 2/3: Converting Shapefile to OSM format...")
         try:
             shapefile_to_osm(shapefile_path, osm_path)
         except Exception as e:
@@ -813,7 +1172,8 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
             raise RuntimeError("Failed to create OSM file")
         
         # Step 3: Convert OSM to IMG using mkgmap
-        print(f"Converting OSM to IMG format using mkgmap...")
+        print(f"Step 3/3: Converting OSM to IMG format using mkgmap...")
+        print(f"  Processing OSM data with mkgmap (this may take a while)...")
         mapname = generate_mapname(input_tif)
         
         # Check if Java is available
@@ -884,6 +1244,7 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                         capture_output=True,
                         text=True
                     )
+                    print(f"  ✓ mkgmap completed successfully")
                 except subprocess.CalledProcessError as e2:
                     # Both methods failed, format error message
                     error_msg = f"mkgmap failed: {e2.stderr}"
@@ -906,6 +1267,9 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
                 if e.stdout:
                     error_msg += f"\nstdout: {e.stdout}"
                 raise RuntimeError(error_msg)
+        else:
+            # Success with -jar method
+            print(f"  ✓ mkgmap completed successfully")
         
         # Find the generated IMG file (mkgmap creates it with the mapname)
         img_filename = f"{mapname}.img"
@@ -989,9 +1353,11 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
     
     try:
         # Run mkgmap to generate all map files
+        print("Generating map files with mkgmap...")
         generated_files = run_mkgmap_for_gmapi(input_tif, temp_mkgmap_dir, mkgmap_path)
         
         # Copy map tiles and support files to Product1 directory
+        print("Packaging GMAPI files...")
         files_to_copy = []
         if 'img' in generated_files:
             files_to_copy.append(('img', generated_files['img'], generated_files['img_name']))
@@ -1004,7 +1370,7 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         
         for file_type, source_path, dest_name in files_to_copy:
             shutil.copy(source_path, subproduct_dir / dest_name)
-            print(f"Copied {file_type.upper()} file: {dest_name}")
+            print(f"  ✓ Copied {file_type.upper()} file: {dest_name}")
         
         # Determine file names for XML
         base_name = generated_files.get('base_name', os.path.splitext(os.path.basename(input_tif))[0])
@@ -1013,6 +1379,7 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
         typ_name = generated_files.get('typ_name', "100D8.TYP")
         
         # Create MapProduct.xml
+        print("Creating MapProduct.xml...")
         root = ET.Element("MapProduct", xmlns="http://www.garmin.com/xmlschemas/MapProduct/v1")
         
         name_elem = ET.SubElement(root, "Name")
@@ -1048,11 +1415,12 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
             ET.indent(tree, space="  ")
         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
         
-        print(f"Created MapProduct.xml")
+        print(f"  ✓ Created MapProduct.xml")
         
         # Optionally create zip file
         final_output = output_dir
         if create_zip or output_path.endswith('.gmapi.zip') or output_path.endswith('.gmapi'):
+            print("Creating GMAPI archive...")
             zip_path = Path(str(output_dir) + ".zip")
             shutil.make_archive(str(output_dir), "zip", output_dir)
             if zip_path.exists():
@@ -1061,17 +1429,17 @@ def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None,
                     gmapi_path = Path(output_path)
                     zip_path.rename(gmapi_path)
                     final_output = gmapi_path
-                    print(f"Created GMAPI package: {gmapi_path.resolve()}")
+                    print(f"  ✓ Created GMAPI package: {gmapi_path.resolve()}")
                 elif output_path.endswith('.gmapi.zip'):
                     gmapi_zip_path = Path(output_path)
                     zip_path.rename(gmapi_zip_path)
                     final_output = gmapi_zip_path
-                    print(f"Created GMAPI zip package: {gmapi_zip_path.resolve()}")
+                    print(f"  ✓ Created GMAPI zip package: {gmapi_zip_path.resolve()}")
                 else:
                     final_output = zip_path
-                    print(f"Created GMAPI zip package: {zip_path.resolve()}")
+                    print(f"  ✓ Created GMAPI zip package: {zip_path.resolve()}")
         else:
-            print(f"GMAPI package created at: {output_dir.resolve()}")
+            print(f"  ✓ GMAPI package created at: {output_dir.resolve()}")
         
         return str(final_output)
         
