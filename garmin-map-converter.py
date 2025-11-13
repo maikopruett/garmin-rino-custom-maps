@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Garmin Custom Map Converter
-Converts GeoTIFF files to Garmin-compatible KMZ or IMG files.
+Converts GeoTIFF files to Garmin-compatible KMZ, IMG, or GMAPI files.
 """
 
 import argparse
@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from pathlib import Path
 from osgeo import gdal
 from osgeo import osr
 from osgeo import ogr
@@ -570,6 +571,191 @@ def shapefile_to_osm(shapefile_path, osm_path):
     tree.write(osm_path, encoding="utf-8", xml_declaration=True)
 
 
+def run_mkgmap_for_gmapi(input_tif, mkgmap_output_dir, mkgmap_path=None):
+    """
+    Run mkgmap to generate all map files (.img, .tdb, .typ, .mdx) needed for GMAPI.
+    
+    Args:
+        input_tif: Path to input GeoTIFF file
+        mkgmap_output_dir: Directory where mkgmap should write output files
+        mkgmap_path: Optional path to mkgmap.jar (will auto-detect if not provided)
+        
+    Returns:
+        dict: Dictionary with paths to generated files and mapname
+    """
+    # Find mkgmap.jar
+    mkgmap_jar = find_mkgmap_jar(mkgmap_path)
+    
+    # Create temporary directory for intermediate files
+    temp_dir = tempfile.mkdtemp(prefix="garmin_gmapi_")
+    
+    try:
+        base_name = os.path.splitext(os.path.basename(input_tif))[0]
+        shapefile_path = os.path.join(temp_dir, base_name + ".shp")
+        osm_path = os.path.join(temp_dir, base_name + ".osm")
+        
+        os.makedirs(mkgmap_output_dir, exist_ok=True)
+        
+        # Step 1: Convert GeoTIFF to Shapefile using gdal_polygonize
+        print(f"Converting {input_tif} to Shapefile format...")
+        try:
+            result = subprocess.run(
+                ["gdal_polygonize.py", input_tif, "-f", "ESRI Shapefile", shapefile_path],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                "gdal_polygonize.py not found. Make sure GDAL is properly installed and "
+                "gdal_polygonize.py is in your PATH."
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"gdal_polygonize.py failed: {e.stderr}")
+        
+        # Check if shapefile was created
+        if not os.path.exists(shapefile_path):
+            raise RuntimeError("gdal_polygonize.py did not create Shapefile")
+        
+        # Step 2: Convert Shapefile to OSM format using Python/GDAL
+        print(f"Converting Shapefile to OSM format...")
+        try:
+            shapefile_to_osm(shapefile_path, osm_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to convert Shapefile to OSM: {str(e)}")
+        
+        if not os.path.exists(osm_path):
+            raise RuntimeError("Failed to create OSM file")
+        
+        # Step 3: Convert OSM to IMG using mkgmap (with all necessary outputs)
+        print(f"Running mkgmap to generate map files...")
+        mapname = generate_mapname(input_tif)
+        
+        # Check if Java is available
+        java_cmd = shutil.which("java")
+        if not java_cmd:
+            raise FileNotFoundError(
+                "Java runtime not found. Please install Java (JRE) to use GMAPI conversion."
+            )
+        
+        # Build classpath for mkgmap
+        current_dir = os.getcwd()
+        mkgmap_jar_abs = os.path.abspath(mkgmap_jar)
+        
+        jar_files = [mkgmap_jar_abs]
+        jar_paths_set = {mkgmap_jar_abs}
+        
+        lib_dir = os.path.join(current_dir, "lib")
+        if os.path.exists(lib_dir) and os.path.isdir(lib_dir):
+            for file in os.listdir(lib_dir):
+                if file.endswith('.jar'):
+                    jar_path = os.path.abspath(os.path.join(lib_dir, file))
+                    if jar_path not in jar_paths_set:
+                        jar_files.append(jar_path)
+                        jar_paths_set.add(jar_path)
+        
+        # Build Java command - use --tdbfile and other options to ensure all files are generated
+        java_args_jar = [
+            "java", "-jar", mkgmap_jar,
+            f"--output-dir={mkgmap_output_dir}",
+            f"--mapname={mapname}",
+            f"--tdbfile={base_name}.tdb",
+            osm_path
+        ]
+        
+        try:
+            result = subprocess.run(
+                java_args_jar,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+        except subprocess.CalledProcessError as e:
+            # Try classpath method if -jar fails
+            if "NoClassDefFoundError" in e.stderr or "ClassNotFoundException" in e.stderr:
+                print(f"  -jar method failed, trying with classpath (found {len(jar_files)} JAR files)")
+                jar_files_clean = [j for j in jar_files if j != mkgmap_jar_abs]
+                jar_files_clean.insert(0, mkgmap_jar_abs)
+                classpath = os.pathsep.join(jar_files_clean)
+                java_args_cp = [
+                    "java", "-cp", classpath,
+                    "uk.me.parabola.mkgmap.Main",
+                    f"--output-dir={mkgmap_output_dir}",
+                    f"--mapname={mapname}",
+                    f"--tdbfile={base_name}.tdb",
+                    osm_path
+                ]
+                try:
+                    result = subprocess.run(
+                        java_args_cp,
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                except subprocess.CalledProcessError as e2:
+                    error_msg = f"mkgmap failed: {e2.stderr}"
+                    if e2.stdout:
+                        error_msg += f"\nstdout: {e2.stdout}"
+                    raise RuntimeError(error_msg)
+            else:
+                error_msg = f"mkgmap failed: {e.stderr}"
+                if e.stdout:
+                    error_msg += f"\nstdout: {e.stdout}"
+                raise RuntimeError(error_msg)
+        
+        # Collect all generated files
+        generated_files = {}
+        
+        # Find .img file
+        img_filename = f"{mapname}.img"
+        img_path = os.path.join(mkgmap_output_dir, img_filename)
+        if not os.path.exists(img_path):
+            img_files = [f for f in os.listdir(mkgmap_output_dir) if f.endswith('.img')]
+            if img_files:
+                img_path = os.path.join(mkgmap_output_dir, img_files[0])
+                img_filename = img_files[0]
+            else:
+                raise RuntimeError(f"mkgmap did not create IMG file in {mkgmap_output_dir}")
+        generated_files['img'] = img_path
+        generated_files['img_name'] = img_filename
+        
+        # Find .tdb file
+        tdb_filename = f"{base_name}.tdb"
+        tdb_path = os.path.join(mkgmap_output_dir, tdb_filename)
+        if not os.path.exists(tdb_path):
+            tdb_files = [f for f in os.listdir(mkgmap_output_dir) if f.endswith('.tdb')]
+            if tdb_files:
+                tdb_path = os.path.join(mkgmap_output_dir, tdb_files[0])
+                tdb_filename = tdb_files[0]
+        if os.path.exists(tdb_path):
+            generated_files['tdb'] = tdb_path
+            generated_files['tdb_name'] = tdb_filename
+        
+        # Find .typ file
+        typ_files = [f for f in os.listdir(mkgmap_output_dir) if f.endswith('.typ')]
+        if typ_files:
+            typ_path = os.path.join(mkgmap_output_dir, typ_files[0])
+            generated_files['typ'] = typ_path
+            generated_files['typ_name'] = typ_files[0]
+        
+        # Find .mdx file
+        mdx_files = [f for f in os.listdir(mkgmap_output_dir) if f.endswith('.mdx')]
+        if mdx_files:
+            mdx_path = os.path.join(mkgmap_output_dir, mdx_files[0])
+            generated_files['mdx'] = mdx_path
+            generated_files['mdx_name'] = mdx_files[0]
+        
+        generated_files['mapname'] = mapname
+        generated_files['base_name'] = base_name
+        
+        return generated_files
+        
+    finally:
+        # Clean up temporary directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
 def tif_to_img(input_tif, output_path, mkgmap_path=None):
     """
     Convert GeoTIFF to Garmin IMG format using gdal_polygonize and mkgmap.
@@ -747,6 +933,154 @@ def tif_to_img(input_tif, output_path, mkgmap_path=None):
             shutil.rmtree(temp_dir)
 
 
+def tif_to_gmapi(input_tif, output_path, mkgmap_path=None, map_name=None, 
+                  family_id=None, product_id=1, data_version="27", create_zip=False):
+    """
+    Convert GeoTIFF to Garmin GMAPI format (BaseCamp-compatible).
+    
+    Args:
+        input_tif: Path to input GeoTIFF file
+        output_path: Path to output GMAPI directory or .gmapi file
+        mkgmap_path: Optional path to mkgmap.jar (will auto-detect if not provided)
+        map_name: Name for the map (default: derived from input filename)
+        family_id: Family ID for the map (default: derived from filename hash)
+        product_id: Product ID (default: 1)
+        data_version: Data version string (default: "27")
+        create_zip: If True, create a .gmapi.zip file instead of directory
+        
+    Returns:
+        Path to the created GMAPI directory or file
+    """
+    import hashlib
+    
+    # Determine output directory
+    if output_path.endswith('.gmapi.zip'):
+        # Remove both .gmapi.zip extensions to get directory name
+        output_dir = Path(output_path[:-10])  # Remove '.gmapi.zip'
+    elif output_path.endswith('.gmapi'):
+        # Remove .gmapi extension to get directory name
+        output_dir = Path(output_path[:-6])  # Remove '.gmapi'
+    else:
+        output_dir = Path(output_path)
+    
+    # Clean and create gmapi directory
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True)
+    
+    # Create subproduct folder (Garmin expects "Product1")
+    subproduct_dir = output_dir / "Product1"
+    subproduct_dir.mkdir()
+    
+    # Generate map name if not provided
+    if map_name is None:
+        base_name = os.path.splitext(os.path.basename(input_tif))[0]
+        map_name = base_name.replace("_", " ").title()
+    
+    # Generate family_id if not provided (8-digit number from filename hash)
+    if family_id is None:
+        base_name = os.path.splitext(os.path.basename(input_tif))[0]
+        hash_obj = hashlib.md5(base_name.encode())
+        hash_hex = hash_obj.hexdigest()
+        family_id = int(hash_hex[:8], 16) % 100000000  # Ensure it's 8 digits max
+    
+    # Create temporary directory for mkgmap output
+    temp_mkgmap_dir = tempfile.mkdtemp(prefix="mkgmap_gmapi_")
+    
+    try:
+        # Run mkgmap to generate all map files
+        generated_files = run_mkgmap_for_gmapi(input_tif, temp_mkgmap_dir, mkgmap_path)
+        
+        # Copy map tiles and support files to Product1 directory
+        files_to_copy = []
+        if 'img' in generated_files:
+            files_to_copy.append(('img', generated_files['img'], generated_files['img_name']))
+        if 'tdb' in generated_files:
+            files_to_copy.append(('tdb', generated_files['tdb'], generated_files['tdb_name']))
+        if 'typ' in generated_files:
+            files_to_copy.append(('typ', generated_files['typ'], generated_files['typ_name']))
+        if 'mdx' in generated_files:
+            files_to_copy.append(('mdx', generated_files['mdx'], generated_files['mdx_name']))
+        
+        for file_type, source_path, dest_name in files_to_copy:
+            shutil.copy(source_path, subproduct_dir / dest_name)
+            print(f"Copied {file_type.upper()} file: {dest_name}")
+        
+        # Determine file names for XML
+        base_name = generated_files.get('base_name', os.path.splitext(os.path.basename(input_tif))[0])
+        tdb_name = generated_files.get('tdb_name', f"{base_name}.tdb")
+        mdx_name = generated_files.get('mdx_name', f"{base_name}.mdx")
+        typ_name = generated_files.get('typ_name', "100D8.TYP")
+        
+        # Create MapProduct.xml
+        root = ET.Element("MapProduct", xmlns="http://www.garmin.com/xmlschemas/MapProduct/v1")
+        
+        name_elem = ET.SubElement(root, "Name")
+        name_elem.text = map_name
+        
+        dataversion_elem = ET.SubElement(root, "DataVersion")
+        dataversion_elem.text = data_version
+        
+        dataformat_elem = ET.SubElement(root, "DataFormat")
+        dataformat_elem.text = "Original"
+        
+        fid_elem = ET.SubElement(root, "ID")
+        fid_elem.text = str(family_id)
+        
+        idx_elem = ET.SubElement(root, "IDX")
+        idx_elem.text = mdx_name
+        
+        typ_elem = ET.SubElement(root, "TYP")
+        typ_elem.text = typ_name
+        
+        sub_elem = ET.SubElement(root, "SubProduct")
+        ET.SubElement(sub_elem, "Name").text = map_name
+        ET.SubElement(sub_elem, "ID").text = str(product_id)
+        ET.SubElement(sub_elem, "BaseMap").text = map_name.replace(" ", "_")
+        ET.SubElement(sub_elem, "TDB").text = tdb_name
+        ET.SubElement(sub_elem, "Directory").text = "Product1"
+        
+        # Save XML
+        xml_path = output_dir / "MapProduct.xml"
+        tree = ET.ElementTree(root)
+        # ET.indent is available in Python 3.9+
+        if hasattr(ET, 'indent'):
+            ET.indent(tree, space="  ")
+        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+        
+        print(f"Created MapProduct.xml")
+        
+        # Optionally create zip file
+        final_output = output_dir
+        if create_zip or output_path.endswith('.gmapi.zip') or output_path.endswith('.gmapi'):
+            zip_path = Path(str(output_dir) + ".zip")
+            shutil.make_archive(str(output_dir), "zip", output_dir)
+            if zip_path.exists():
+                # Rename to .gmapi or .gmapi.zip if requested
+                if output_path.endswith('.gmapi'):
+                    gmapi_path = Path(output_path)
+                    zip_path.rename(gmapi_path)
+                    final_output = gmapi_path
+                    print(f"Created GMAPI package: {gmapi_path.resolve()}")
+                elif output_path.endswith('.gmapi.zip'):
+                    gmapi_zip_path = Path(output_path)
+                    zip_path.rename(gmapi_zip_path)
+                    final_output = gmapi_zip_path
+                    print(f"Created GMAPI zip package: {gmapi_zip_path.resolve()}")
+                else:
+                    final_output = zip_path
+                    print(f"Created GMAPI zip package: {zip_path.resolve()}")
+        else:
+            print(f"GMAPI package created at: {output_dir.resolve()}")
+        
+        return str(final_output)
+        
+    finally:
+        # Clean up temporary mkgmap directory
+        if os.path.exists(temp_mkgmap_dir):
+            shutil.rmtree(temp_mkgmap_dir)
+
+
 def find_tif_files(directory):
     """
     Find all TIF/TIFF files in the specified directory.
@@ -819,7 +1153,7 @@ def select_tif_file_interactive(main_folder):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert GeoTIFF files to Garmin-compatible KMZ or IMG files'
+        description='Convert GeoTIFF files to Garmin-compatible KMZ, IMG, or GMAPI files'
     )
     parser.add_argument(
         'input',
@@ -828,18 +1162,18 @@ def main():
     )
     parser.add_argument(
         '-o', '--output',
-        help='Path to output file (default: input filename with .kmz or .img extension)',
+        help='Path to output file (default: input filename with .kmz, .img, or .gmapi extension)',
         default=None
     )
     parser.add_argument(
         '--type',
-        choices=['kmz', 'img'],
+        choices=['kmz', 'img', 'gmapi'],
         default=None,
-        help='Conversion type: kmz or img (if not provided, will prompt interactively)'
+        help='Conversion type: kmz, img, or gmapi (if not provided, will prompt interactively)'
     )
     parser.add_argument(
         '--mkgmap-path',
-        help='Path to mkgmap.jar (required for IMG conversion, will auto-detect if not provided)',
+        help='Path to mkgmap.jar (required for IMG and GMAPI conversion, will auto-detect if not provided)',
         default=None
     )
     parser.add_argument(
@@ -873,15 +1207,18 @@ def main():
         # Interactive prompt
         while True:
             try:
-                user_input = input("Select conversion type: 1) KMZ  2) IMG [1]: ").strip()
+                user_input = input("Select conversion type: 1) KMZ  2) IMG  3) GMAPI [1]: ").strip()
                 if user_input == '' or user_input == '1':
                     conversion_type = 'kmz'
                     break
                 elif user_input == '2':
                     conversion_type = 'img'
                     break
+                elif user_input == '3':
+                    conversion_type = 'gmapi'
+                    break
                 else:
-                    print("Invalid choice. Please enter 1 or 2.")
+                    print("Invalid choice. Please enter 1, 2, or 3.")
             except (EOFError, KeyboardInterrupt):
                 print("\nCancelled.")
                 return 1
@@ -890,7 +1227,12 @@ def main():
     if args.output is None:
         base_name = os.path.splitext(os.path.basename(args.input))[0]
         output_dir = os.path.dirname(args.input) or '.'
-        extension = '.img' if conversion_type == 'img' else '.kmz'
+        if conversion_type == 'img':
+            extension = '.img'
+        elif conversion_type == 'gmapi':
+            extension = '.gmapi'
+        else:
+            extension = '.kmz'
         args.output = os.path.join(output_dir, base_name + extension)
     
     # Branch based on conversion type
@@ -933,9 +1275,18 @@ def main():
                 shutil.rmtree(temp_dir)
     
     elif conversion_type == 'img':
-        # IMG conversion (new flow)
+        # IMG conversion
         try:
             tif_to_img(args.input, args.output, args.mkgmap_path)
+            return 0
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            return 1
+    
+    elif conversion_type == 'gmapi':
+        # GMAPI conversion (BaseCamp-compatible)
+        try:
+            tif_to_gmapi(args.input, args.output, args.mkgmap_path)
             return 0
         except Exception as e:
             print(f"Error: {str(e)}")
