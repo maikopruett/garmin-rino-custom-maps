@@ -198,7 +198,7 @@ optional arguments:
   --mkgmap-path MKGMAP_PATH
                         Path to mkgmap.jar (required for IMG conversion, will auto-detect if not provided)
   --temp-dir TEMP_DIR   Temporary directory for intermediate files (default: project/.garmin_temp)
-  --java-max-memory JAVA_MAX_MEMORY
+  --java-max-memory 8G
                         Maximum Java heap passed to mkgmap via -Xmx (default: 4G)
 ```
 
